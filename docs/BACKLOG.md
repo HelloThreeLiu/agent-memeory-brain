@@ -13,7 +13,7 @@
 | P0-4 | feat(recall) | M | FTS5 + 中文 2-gram 召回，两因子打分（相关性 + 重要度） | 200 条种子数据、20 个查询人工命中 ≥70%；单次召回 <100ms | todo |
 | P0-5 | feat(cli) | M | `remember` / `recall` 两个命令 | 断网、无 API key 时可用 | todo |
 | P0-6 | docs(design) | S | 冻结 schema 后回填设计文档 §8.1 的实际 DDL | 文档 DDL 与代码一致（脚本比对） | todo |
-| CI-1 | chore(ci) | L | 升级 `actions/checkout` / `actions/setup-python` 到 v7 | CI 无 Node20 弃用告警；门禁全绿 | doing |
+| CI-1 | chore(ci) | L | 升级 `actions/checkout` / `actions/setup-python` 到 v7 | CI 无 Node20 弃用告警；门禁全绿 | done |
 
 ## 待定（等数据，不排期）
 
@@ -28,3 +28,5 @@
 | ID | 事项 | 提交 |
 |---|---|---|
 | D-1 | 调研 + 设计 v0.5（三轮评审 25 条全部处理） | `aa314cc` |
+| D-2 | 研发流程规范 + CI 门禁落地 | `58b0d21` / `df29a9b` |
+| D-3 | CI actions 升级至 v7，Node20 告警消除（PR #1） | `481e435` |

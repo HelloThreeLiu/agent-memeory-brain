@@ -90,9 +90,12 @@
 | D-2 | 研发流程规范 + CI 门禁落地 | `58b0d21` / `df29a9b` |
 | D-3 | CI actions 升级至 v7，Node20 告警消除（PR #1） | `481e435` |
 | D-4 | main 分支保护 ruleset 与小改动快车道（PR #2） | `01e3091` |
-| P0-1 | schema v1 + 迁移执行器 + INV 触发器 | `a65d396` |
-| P0-2/P0-3 | 唯一写入口 + 9.3 冲突路由（纯函数）与 INV 断言 | `0aa6076` |
-| P0-4 | FTS5 中文 2-gram + 两因子打分 + 一席制 | `50f5844` |
-| P0-5 | CLI：init / remember / recall / status | `1e3990c` |
-| P0-6 | 设计文档 §8.1.1 回填实际 DDL + 同步门禁 | 本批 docs 提交 |
-| build | pyproject 与门禁配置（运行时零依赖） | `39fde29` |
+| P0-1 | schema v1 + 迁移执行器 + INV 触发器 | `0611c5a` |
+| P0-2/P0-3 | 唯一写入口 + 9.3 冲突路由（纯函数）与 INV 断言 | `6232659` |
+| P0-4 | FTS5 中文 2-gram + 两因子打分 + 一席制 | `fd4a86b` |
+| P0-5 | CLI：init / remember / recall / status | `a32c557` |
+| P0-6 | 设计文档 §8.1.1 回填实际 DDL + 同步门禁 | `903a0d4` |
+| build | pyproject 与门禁配置（运行时零依赖） | `4de6c46` |
+| review-1 | 首轮审查 12 条修复 | `dd4b40c` / `1061327` / `ab9eb70` |
+| review-2 | 二轮审查 M-1（schema v2 + 仲裁槽位） | `451715a` / `76767ef` |
+| ci | 零依赖时跳过 pip-audit | `427c644` |

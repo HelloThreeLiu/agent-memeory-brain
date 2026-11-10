@@ -2,7 +2,7 @@
 
 > 给 AI 助手一套**能追溯、能回滚、能看见**的记忆。本地优先，零模型也能跑。
 
-**状态：设计定稿（v0.5），实现未开始。** 设计文档经过三轮独立评审，25 条意见全部处理；当前没有可运行代码，下面的命令是 P0 的目标形态，不是现在能用的。
+**状态：P0 骨架可用（v0.0.1）。** 设计文档经过三轮独立评审，25 条意见全部处理；P0 已落地 schema、不变量断言、中文两因子召回与 CLI。还没有宿主接入（P1.5 起），`explain` / `forget` 等治理能力在 P1。
 
 ---
 
@@ -79,23 +79,26 @@ Nebula 想解决的是第三类——**记忆的可解释性与可撤销性**。
 
 A 档 = 自动注入，模型无感；B 档 = 靠指令块驱动模型主动调工具，会漏但能用。
 
-## 目标形态（P0 完成后）
+## 现在能跑的部分
 
 ```bash
 git clone https://github.com/HelloThreeLiu/agent-memeory-brain.git
 cd agent-memeory-brain
 
-python -m nebula init                    # 建库、建 FTS 索引
-python -m nebula remember "接口统一用 POST"
-python -m nebula recall "接口用什么方法"
-python -m nebula explain <id>            # 这条记忆凭什么存在
+python -m nebula init                      # 建库、建 FTS 索引（默认 ~/.nebula/memory.db）
+python -m nebula remember "接口统一用 POST" --key api.method
+python -m nebula remember "构建命令是 npm run build" --key build.cmd
+python -m nebula recall "接口用什么方法"     # 打印注入格式，--json 给机器读
+python -m nebula status                    # 库的规模与状态
 ```
+
+零运行时依赖、断网可用、不需要任何 API key。库路径优先级：`--db` > `NEBULA_DB` > `~/.nebula/memory.db`。
 
 ## 路线
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
-| P0 | schema + 不变量断言 + 两因子召回 + CLI | 未开始 |
+| P0 | schema + 不变量断言 + 两因子召回 + CLI | 已完成（v0.0.1） |
 | P1 | 晋升 / 失效 / 归档 / 睡眠周期 / `explain` | 未开始 |
 | P1.5 | 单宿主接入，攒真实召回日志（校准阈值的唯一机会） | 未开始 |
 | P2 | 星图 v1：快照 + 宇宙视图 + 时间回放 | 未开始 |
@@ -121,7 +124,12 @@ agent-memeory-brain/
 ├── WORKFLOW.md      研发流程（硬约束）
 ├── AGENTS.md        AI 协作入口
 ├── .github/         CI 门禁
-└── nebula/          （P0 创建）引擎
+├── nebula/          引擎
+│   ├── core/        纯逻辑：路由、打分、分词、时间（无 I/O，可穷举单测）
+│   ├── store/       schema、迁移、write_service（唯一写入口）
+│   ├── recall/      候选池谓词 + FTS5 + 一席制
+│   └── __main__.py  CLI
+└── tests/           不变量断言与检索回归
 ```
 
 ## 参与开发

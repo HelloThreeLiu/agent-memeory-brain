@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from nebula.recall.search import recall
+from nebula.recall.search import Hit, recall
 from nebula.store.write_service import WriteResult, WriteService
 from tests.seed import QUERIES, seeded_contents
 
@@ -209,6 +210,26 @@ def test_open_arbitration_pair_is_injected_together(
     result = recall(conn, "接口方法", 5)
     assert len(result.hits) == 2
     assert {hit.assertion_type for hit in result.hits} == {"decision", "observation"}
+
+
+def test_injection_line_marks_unverified_claims() -> None:
+    """claim / hypothesis 必须带"未验证"，否则注入时和 observation 长得一模一样。"""
+    base = Hit(
+        id="mem-1",
+        content="接口方法存疑",
+        assertion_type="claim",
+        role="reviewer",
+        fact_key=None,
+        layer="semantic",
+        importance=0.5,
+        relevance=0.5,
+        score=0.3,
+        seq=1,
+        pinned=False,
+    )
+    assert "|未验证" in base.format_line()
+    assert "|未验证" in replace(base, assertion_type="hypothesis").format_line()
+    assert "|未验证" not in replace(base, assertion_type="observation").format_line()
 
 
 def test_private_rows_are_filtered_in_the_pool(

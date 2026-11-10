@@ -247,8 +247,8 @@ def _open_pairs(conn: sqlite3.Connection, ids: tuple[str, ...]) -> set[frozenset
     placeholders = ",".join("?" for _ in ids)
     rows = conn.execute(
         "SELECT left_id, right_id FROM arbitration "
-        f"WHERE status = 'open' AND left_id IN ({placeholders})",
-        ids,
+        f"WHERE status = 'open' AND (left_id IN ({placeholders}) OR right_id IN ({placeholders}))",
+        (*ids, *ids),
     ).fetchall()
     return {frozenset((str(row["left_id"]), str(row["right_id"]))) for row in rows}
 

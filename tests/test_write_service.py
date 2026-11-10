@@ -14,7 +14,7 @@ import pytest
 
 from nebula.recall.search import recall
 from nebula.store.db import open_database
-from nebula.store.write_service import WriteResult, WriteService
+from nebula.store.write_service import WriteResult, WriteService, content_hash
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE = datetime(2026, 5, 1, 9, 0, tzinfo=UTC)
@@ -272,6 +272,142 @@ def test_dedupe_does_not_cross_visibility(
 def test_private_memory_requires_a_session(service: WriteService) -> None:
     with pytest.raises(ValueError, match="session_id"):
         service.remember("私有片段但没有 session", visibility="private", evidence=("ep-1",))
+
+
+def test_arbitration_is_scoped_to_the_slot(
+    conn: sqlite3.Connection, write: Callable[..., WriteResult]
+) -> None:
+    """两个私有 session 的同名键各自开仲裁，不能共用一个 fact_key 全局仲裁。
+
+    二轮审查 M-1 变体 1：复用查询只看 fact_key，s-2 的挑战被挂到 s-1 的仲裁上，
+    (mem-3, mem-4) 零记录、recall 里挑战静默消失。
+    """
+    write(
+        "接口方法定为 POST",
+        assertion_type="decision",
+        role="user",
+        visibility="private",
+        session_id="s-1",
+        fact_key="arb.slot",
+    )
+    first_pair = write(
+        "接口方法其实是 GET",
+        assertion_type="observation",
+        role="agent",
+        visibility="private",
+        session_id="s-1",
+        fact_key="arb.slot",
+    )
+    second_decision = write(
+        "接口方法定为 PUT",
+        assertion_type="decision",
+        role="user",
+        visibility="private",
+        session_id="s-2",
+        fact_key="arb.slot",
+    )
+    second_pair = write(
+        "接口方法其实是 PATCH",
+        assertion_type="observation",
+        role="agent",
+        visibility="private",
+        session_id="s-2",
+        fact_key="arb.slot",
+    )
+
+    rows = conn.execute(
+        "SELECT id, left_id, right_id, scope, visibility, session_id FROM arbitration"
+    ).fetchall()
+    assert len(rows) == 2, "两个槽位应该各有一条仲裁记录"
+    assert second_pair.arbitration_id != first_pair.arbitration_id
+    second = conn.execute(
+        "SELECT left_id, right_id, visibility, session_id FROM arbitration WHERE id = ?",
+        (second_pair.arbitration_id,),
+    ).fetchone()
+    assert second["session_id"] == "s-2"
+    assert second["visibility"] == "private"
+    assert {str(second["left_id"]), str(second["right_id"])} == {
+        second_decision.id,
+        second_pair.id,
+    }
+
+    # 两个 session 各自双注入，谁也别把谁挤掉
+    s2_hits = recall(conn, "接口方法", viewer_session="s-2").hits
+    assert len(s2_hits) == 2
+
+
+def test_superseded_pair_is_closed_and_new_challenge_gets_its_own(
+    conn: sqlite3.Connection, write: Callable[..., WriteResult]
+) -> None:
+    """二轮审查 M-1 变体 2：B 路由顶掉对子一侧后，旧仲裁必须落终态，
+    新挑战要拿到自己的仲裁记录，否则召回只剩拍板那条。"""
+    write("接口方法定为 POST", assertion_type="decision", role="user", fact_key="arb.stale")
+    challenger = write(
+        "接口方法其实是 GET", assertion_type="observation", role="agent", fact_key="arb.stale"
+    )
+    assert challenger.arbitration_id is not None
+    settled = write(
+        "接口方法定为 PUT", assertion_type="decision", role="user", fact_key="arb.stale"
+    )
+
+    row = conn.execute(
+        "SELECT status, resolution, resolved_by FROM arbitration WHERE id = ?",
+        (challenger.arbitration_id,),
+    ).fetchone()
+    assert row["status"] == "resolved"
+    assert row["resolution"] == "left", "存续的是 base（left）一侧"
+    assert row["resolved_by"] == "system:b-route"
+
+    fresh = write(
+        "接口方法其实是 PATCH", assertion_type="observation", role="agent", fact_key="arb.stale"
+    )
+    assert fresh.arbitration_id != challenger.arbitration_id
+    pair = conn.execute(
+        "SELECT left_id, right_id, status FROM arbitration WHERE id = ?", (fresh.arbitration_id,)
+    ).fetchone()
+    assert pair["status"] == "open"
+    assert {str(pair["left_id"]), str(pair["right_id"])} == {settled.id, fresh.id}
+
+    injected = {hit.id for hit in recall(conn, "接口方法", 5).hits}
+    assert injected == {settled.id, fresh.id}
+
+
+def test_merge_upgrade_keeps_content_hash_in_sync(
+    conn: sqlite3.Connection, write: Callable[..., WriteResult]
+) -> None:
+    first = write(
+        "接口统一用 POST", assertion_type="decision", role="user", fact_key="merge.hash"
+    )
+    write(
+        "接口统一用 POST，超时 30 秒",
+        assertion_type="decision",
+        role="user",
+        fact_key="merge.hash",
+    )
+    row = conn.execute(
+        "SELECT content, content_hash FROM memories WHERE id = ?", (first.id,)
+    ).fetchone()
+    assert row["content_hash"] == content_hash(str(row["content"]))
+
+
+def test_backfill_supersedes_edge_points_from_survivor(
+    conn: sqlite3.Connection, write: Callable[..., WriteResult]
+) -> None:
+    """补录历史时是"旧条压新条"，边方向应是 current → backfilled。"""
+    current = write("现在的接口是 POST", assertion_type="decision", role="user", fact_key="edge.h")
+    backfilled = write(
+        "以前的接口是 GET",
+        assertion_type="decision",
+        role="user",
+        fact_key="edge.h",
+        valid_from="2025-01-01T00:00:00+00:00",
+    )
+    assert backfilled.action == "supersede_new"
+    edge = conn.execute(
+        "SELECT 1 FROM memory_links WHERE src = ? AND dst = ? AND type = 'supersedes'",
+        (current.id, backfilled.id),
+    ).fetchone()
+    assert edge is not None
 
 
 def test_two_processes_write_two_hundred_rows_without_holes(tmp_path: Path) -> None:

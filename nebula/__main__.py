@@ -13,6 +13,7 @@ import sys
 from collections.abc import Sequence
 
 from nebula import __version__
+from nebula.core.timeutil import now_ts
 from nebula.recall.search import recall
 from nebula.store.db import open_database, resolve_db_path, schema_version
 from nebula.store.write_service import InvariantViolation, WriteService
@@ -185,9 +186,12 @@ def _cmd_status(args: argparse.Namespace) -> int:
         ).fetchall()
         for row in by_layer:
             print(f"  {row['layer']:<9} {row['status']:<9} {row['n']}")
+        stamp = now_ts()
         current = conn.execute(
             "SELECT COUNT(*) FROM memories WHERE status IN ('active','dormant') "
-            "AND valid_to IS NULL"
+            "AND (valid_from IS NULL OR valid_from <= ?) "
+            "AND (valid_to IS NULL OR valid_to > ?)",
+            (stamp, stamp),
         ).fetchone()[0]
         print(f"当前有效：{current}")
         open_arb = conn.execute(

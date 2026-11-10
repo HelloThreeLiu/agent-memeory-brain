@@ -14,7 +14,7 @@
 | P0-5 | feat(cli) | M | `remember` / `recall` 两个命令 | 断网、无 API key 时可用 | todo |
 | P0-6 | docs(design) | S | 冻结 schema 后回填设计文档 §8.1 的实际 DDL | 文档 DDL 与代码一致（脚本比对） | todo |
 | CI-1 | chore(ci) | L | 升级 `actions/checkout` / `actions/setup-python` 到 v7 | CI 无 Node20 弃用告警；门禁全绿 | done |
-| GOV-1 | chore(governance) | L | main 分支保护（禁直推、必需 gate、禁强推/删除、线性历史）+ 小改动快车道 | 直推 main 被服务端拒绝；文档类改动可一条命令合入 | doing |
+| GOV-1 | chore(governance) | L | main 分支保护（禁直推、必需 gate、禁强推/删除、线性历史）+ 小改动快车道 | 直推 main 被服务端拒绝；文档类改动可一条命令合入 | done |
 
 ## 待定（等数据，不排期）
 
@@ -31,3 +31,4 @@
 | D-1 | 调研 + 设计 v0.5（三轮评审 25 条全部处理） | `aa314cc` |
 | D-2 | 研发流程规范 + CI 门禁落地 | `58b0d21` / `df29a9b` |
 | D-3 | CI actions 升级至 v7，Node20 告警消除（PR #1） | `481e435` |
+| D-4 | main 分支保护 ruleset 与小改动快车道（PR #2） | `01e3091` |

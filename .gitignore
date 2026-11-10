@@ -1,0 +1,30 @@
+# 本地 Agent 数据：会话记忆、缓存、工具结果，不入库
+.workbuddy/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# 本地记忆库与派生数据：库文件、导出、快照都不入库
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+exports/
+snapshots/
+
+# 打包产物
+build/
+dist/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log

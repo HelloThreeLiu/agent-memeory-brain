@@ -32,10 +32,12 @@ WRITE_PATTERNS = (
 
 
 def test_inv1_only_write_service_issues_writes() -> None:
+    """唯一的运行时写入口。``schema.py`` 例外：它只有迁移期的一次性回填语句。"""
     package_root = Path(nebula.__file__).parent
+    allowed = {"write_service.py", "schema.py"}
     offenders: list[str] = []
     for path in package_root.rglob("*.py"):
-        if path.name == "write_service.py":
+        if path.name in allowed:
             continue
         text = path.read_text(encoding="utf-8")
         for pattern in WRITE_PATTERNS:

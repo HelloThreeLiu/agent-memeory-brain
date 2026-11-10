@@ -387,17 +387,28 @@ class WriteService:
             upgraded = len(draft.content) > len(old.content) and conflict.is_superset(
                 draft.content, old.content
             )
-            self._conn.execute(
-                "UPDATE memories SET evidence = ?, weight = weight + ?, content = ? WHERE id = ?",
-                (
-                    json.dumps(merged, ensure_ascii=False),
-                    MERGE_WEIGHT_STEP,
-                    draft.content if upgraded else old.content,
-                    old.id,
-                ),
-            )
             if upgraded:
+                # 正文换了，content_hash 必须同步，否则完整性校验会误报
+                self._conn.execute(
+                    """
+                    UPDATE memories
+                    SET evidence = ?, weight = weight + ?, content = ?, content_hash = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        json.dumps(merged, ensure_ascii=False),
+                        MERGE_WEIGHT_STEP,
+                        draft.content,
+                        draft.digest,
+                        old.id,
+                    ),
+                )
                 self._rewrite_index(old.id, draft.content)
+            else:
+                self._conn.execute(
+                    "UPDATE memories SET evidence = ?, weight = weight + ? WHERE id = ?",
+                    (json.dumps(merged, ensure_ascii=False), MERGE_WEIGHT_STEP, old.id),
+                )
             # 没落新行就不该烧掉一个 seq，否则 seq 会留下无主空洞
             self._conn.execute("UPDATE counter SET value = value - 1 WHERE name = 'seq'")
             self._log_event(
@@ -424,7 +435,8 @@ class WriteService:
 
         if action == conflict.ACTION_SUPERSEDE_NEW:
             self._insert(draft, valid_to=old.valid_from, superseded_by=old.id)
-            self._link(draft.id, old.id, "supersedes")
+            # 方向：更晚的 old 压过补录的 draft（旧条才是"当前"）
+            self._link(old.id, draft.id, "supersedes")
             self._log_event(
                 draft.seq,
                 draft.created_at,
@@ -458,29 +470,39 @@ class WriteService:
             )
             self._link(draft.id, old.id, "supersedes")
             superseded = (old.id,)
+            # 旧条退场可能让本槽位那条 open 仲裁失去一侧 → 顺手落终态，
+            # 否则新挑战会挂到一条已经没人争的死对子上（二轮审查 M-1 变体 2）
+            self._settle_open_arbitration(draft)
 
         if action == conflict.ACTION_CONTRADICT:
             self._link(draft.id, old.id, "contradicts")
 
         if decision.open_arbitration:
-            # 同一 fact_key 只留一条待裁决（INV5 的"不许仲裁泛滥"）：已有 open 就挂上去，
-            # 不能因为唯一索引再插一条把整笔写入搞挂
-            existing = self._conn.execute(
-                "SELECT id FROM arbitration WHERE fact_key = ? AND status = 'open'",
-                (draft.fact_key,),
-            ).fetchone()
-            if existing is not None:
-                arbitration_id = str(existing["id"])
+            # 同一**槽位**只留一条待裁决：能复用就复用，复用不了（对子已失效）
+            # 先给旧的落终态，再开新的——不能像 P0 首版那样挂到死对子上
+            existing_id = self._settle_open_arbitration(draft)
+            if existing_id is not None:
+                arbitration_id = existing_id
             else:
                 arbitration_id = f"arb-{draft.seq}"
                 self._conn.execute(
                     """
                     INSERT INTO arbitration
                         (id, created_at, fact_key, left_id, right_id, status, resolution,
-                         resolved_by, resolved_at)
-                    VALUES (?, ?, ?, ?, ?, 'open', NULL, NULL, NULL)
+                         resolved_by, resolved_at, scope, project_id, visibility, session_id)
+                    VALUES (?, ?, ?, ?, ?, 'open', NULL, NULL, NULL, ?, ?, ?, ?)
                     """,
-                    (arbitration_id, draft.created_at, draft.fact_key, old.id, draft.id),
+                    (
+                        arbitration_id,
+                        draft.created_at,
+                        draft.fact_key,
+                        old.id,
+                        draft.id,
+                        draft.scope,
+                        draft.project_id or "",
+                        draft.visibility,
+                        draft.session_id or "",
+                    ),
                 )
 
         self._log_event(
@@ -499,6 +521,73 @@ class WriteService:
             superseded=superseded,
             arbitration_id=arbitration_id,
             note=decision.reason,
+        )
+
+    def _is_current(self, memory_id: str, now: str) -> bool:
+        row = self._conn.execute(
+            """
+            SELECT 1 FROM memories
+            WHERE id = ? AND status IN ('active', 'dormant')
+              AND (valid_from IS NULL OR valid_from <= ?)
+              AND (valid_to IS NULL OR valid_to > ?)
+            """,
+            (memory_id, now, now),
+        ).fetchone()
+        return row is not None
+
+    def _settle_open_arbitration(self, draft: _Draft) -> str | None:
+        """返回本槽位仍可复用的 open 仲裁 id；对子已失效则先落终态并返回 ``None``。
+
+        必须按**槽位 + 分区**查：只按 fact_key 查会让两个项目、两个私有 session 的
+        同名键共用一条仲裁，新对子既没有记账、召回时又被静默丢掉（二轮审查 M-1）。
+        """
+        row = self._conn.execute(
+            """
+            SELECT id, left_id, right_id FROM arbitration
+            WHERE status = 'open' AND scope = ? AND project_id = ?
+              AND fact_key = ? AND visibility = ? AND session_id = ?
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (
+                draft.scope,
+                draft.project_id or "",
+                draft.fact_key,
+                draft.visibility,
+                draft.session_id or "",
+            ),
+        ).fetchone()
+        if row is None:
+            return None
+        left_id = str(row["left_id"])
+        right_id = str(row["right_id"])
+        left_live = self._is_current(left_id, draft.created_at)
+        right_live = self._is_current(right_id, draft.created_at)
+        if left_live and right_live:
+            return str(row["id"])
+        # 对子只剩一侧还在当前区间：争议已经不存在，按存续侧落终态。
+        # 两侧都不在（只能由人工改库造成）时记 both，避免写一条假的方向。
+        resolution = "left" if left_live else ("right" if right_live else "both")
+        self._resolve_arbitration(str(row["id"]), resolution, draft)
+        return None
+
+    def _resolve_arbitration(self, arbitration_id: str, resolution: str, draft: _Draft) -> None:
+        self._conn.execute(
+            """
+            UPDATE arbitration
+            SET status = 'resolved', resolution = ?, resolved_by = 'system:b-route',
+                resolved_at = ?
+            WHERE id = ?
+            """,
+            (resolution, draft.created_at, arbitration_id),
+        )
+        self._log_event(
+            draft.seq,
+            draft.created_at,
+            draft.host,
+            draft.session_id,
+            "arbitration.auto_resolved",
+            arbitration_id,
+            {"resolution": resolution, "by": "system:b-route"},
         )
 
     def _insert(self, draft: _Draft, *, valid_to: str | None, superseded_by: str | None) -> None:

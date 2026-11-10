@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from nebula.store.schema import CURRENT_SCHEMA_VERSION
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -38,7 +40,7 @@ def test_init_creates_database(tmp_path: Path) -> None:
     result = run_cli(db, "init")
     assert result.returncode == 0, result.stderr
     assert db.exists()
-    assert "schema 版本：1" in result.stdout
+    assert f"schema 版本：{CURRENT_SCHEMA_VERSION}" in result.stdout
 
 
 def test_remember_then_recall(tmp_path: Path) -> None:
@@ -67,6 +69,16 @@ def test_status_reports_counts(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert "记忆总数：1" in result.stdout
     assert "当前有效：1" in result.stdout
+
+
+def test_status_uses_the_current_window(tmp_path: Path) -> None:
+    """未来才生效的条目不该算进"当前有效"。"""
+    db = tmp_path / "cli.db"
+    run_cli(db, "remember", "未来才生效的约定", "--valid-from", "2030-01-01")
+    result = run_cli(db, "status")
+    assert result.returncode == 0, result.stderr
+    assert "记忆总数：1" in result.stdout
+    assert "当前有效：0" in result.stdout
 
 
 def test_write_failure_is_visible(tmp_path: Path) -> None:

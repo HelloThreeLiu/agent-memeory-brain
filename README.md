@@ -94,6 +94,8 @@ python -m nebula status                    # 库的规模与状态
 
 零运行时依赖、断网可用、不需要任何 API key。库路径优先级：`--db` > `NEBULA_DB` > `~/.nebula/memory.db`。
 
+**环境要求**：Python ≥ 3.11，SQLite ≥ 3.39（FTS5 的 `remove_diacritics 2` 与 `UPDATE … RETURNING` 需要它；CPython 3.11+ 的官方 Windows/macOS 构建自带的 SQLite 均满足，部分 Linux 发行版系统库可能偏旧，用 `python -c "import sqlite3;print(sqlite3.sqlite_version)"` 确认）。
+
 ## 路线
 
 | 阶段 | 内容 | 状态 |

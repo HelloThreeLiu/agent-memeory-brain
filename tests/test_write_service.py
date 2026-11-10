@@ -20,19 +20,39 @@ ROOT = Path(__file__).resolve().parents[1]
 BASE = datetime(2026, 5, 1, 9, 0, tzinfo=UTC)
 
 WORKER = """
+import sqlite3
 import sys
+import time
+
 sys.path.insert(0, {root!r})
 from nebula.store.db import open_database
 from nebula.store.write_service import WriteService
 
-conn = open_database({db!r})
+
+def transient(exc):
+    text = str(exc).lower()
+    return "locked" in text or "readonly" in text
+
+
+def retry(action, attempts=5):
+    for attempt in range(attempts):
+        try:
+            return action()
+        except sqlite3.OperationalError as exc:
+            if not transient(exc) or attempt == attempts - 1:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+    raise AssertionError("unreachable")
+
+
+conn = retry(lambda: open_database({db!r}))
 service = WriteService(conn)
 for index in range(100):
-    service.remember(
+    retry(lambda: service.remember(
         "worker " + {tag!r} + " 第 " + str(index) + " 条内容",
         evidence=("ep-conc",),
         role="agent",
-    )
+    ))
 conn.close()
 """
 
@@ -411,6 +431,14 @@ def test_backfill_supersedes_edge_points_from_survivor(
 
 
 def test_two_processes_write_two_hundred_rows_without_holes(tmp_path: Path) -> None:
+    """两个进程各写 100 条：无重复 id、seq 1..200 无洞。
+
+    worker 里对 SQLite 的瞬态 ``locked`` / ``readonly`` 做了有界重试（≤5 次，退避 50ms）。
+    这是 Windows 文件锁 + WAL 在**两个进程直连同一个库**时已知的表现（实测 1/30 量级），
+    不是写入逻辑的问题：重试只覆盖"这一笔没开始/已回滚"，不改变下面的断言——
+    200 个唯一 id 与连续 seq 仍然必须成立，逻辑错（重复、丢写、seq 跳号）重试也救不了。
+    P4 上了 daemon 之后不存在多进程直写，这条重试也就没必要了。
+    """
     db = tmp_path / "concurrent.db"
     # 先建好库，避免两个子进程同时跑迁移
     open_database(str(db)).close()

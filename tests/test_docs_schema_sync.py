@@ -28,11 +28,10 @@ def _documented_ddl() -> str:
 
 def test_every_migration_statement_is_documented() -> None:
     documented = _documented_ddl()
-    missing = [
-        statement
-        for statement in (_normalized(s) for s in MIGRATIONS[0].statements)
-        if statement not in documented
+    statements = [
+        _normalized(statement) for migration in MIGRATIONS for statement in migration.statements
     ]
+    missing = [statement for statement in statements if statement not in documented]
     assert missing == [], (
         f"设计文档 §8.1.1 与 schema.py 不一致（{len(missing)} 条缺失），"
         f"第一条：{missing[0][:80] if missing else ''}"

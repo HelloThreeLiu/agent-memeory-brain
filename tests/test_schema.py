@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from nebula.store.db import migrate, open_database, schema_version
+from nebula.store.db import connect, migrate, open_database, schema_version
 from nebula.store.schema import CURRENT_SCHEMA_VERSION
 
 P0_TABLES = ("memories", "memory_links", "episodes", "events", "arbitration", "counter")
@@ -25,17 +25,30 @@ def insert_memory(
     content: str = "样本内容",
     layer: str = "semantic",
     assertion_type: str = "observation",
+    scope: str = "global",
+    project_id: str | None = None,
 ) -> str:
     memory_id = f"mem-{seq}"
     conn.execute(
         """
         INSERT INTO memories (
-            id, scope, visibility, layer, kind, assertion_type, asserted_by, content,
+            id, scope, project_id, visibility, layer, kind, assertion_type, asserted_by, content,
             status, valid_from, created_at, seq, evidence, content_hash
-        ) VALUES (?, 'global', 'shared', ?, 'fact', ?, '{"role":"agent"}', ?, 'active',
+        ) VALUES (?, ?, ?, 'shared', ?, 'fact', ?, '{"role":"agent"}', ?, 'active',
                   ?, ?, ?, '["ep-1"]', ?)
         """,
-        (memory_id, layer, assertion_type, content, STAMP, STAMP, seq, f"hash-{seq}"),
+        (
+            memory_id,
+            scope,
+            project_id,
+            layer,
+            assertion_type,
+            content,
+            STAMP,
+            STAMP,
+            seq,
+            f"hash-{seq}",
+        ),
     )
     return memory_id
 
@@ -90,6 +103,35 @@ def test_expired_at_is_immutable(conn: sqlite3.Connection) -> None:
         "SELECT COUNT(*) FROM memories WHERE id = ?", (memory_id,)
     ).fetchone()[0]
     assert remaining == 1
+
+
+def test_migrate_v1_to_v2_backfills_arbitration_slot(tmp_path: Path) -> None:
+    """旧库升级：v1 的仲裁行没有槽位字段，v2 迁移要从对子左侧那条回填。"""
+    path = tmp_path / "v1.db"
+    conn = connect(path)
+    try:
+        assert migrate(conn, target=1) == [1]
+        assert schema_version(conn) == 1
+        insert_memory(conn, 1, scope="project", project_id="p1")
+        insert_memory(conn, 2, scope="project", project_id="p1")
+        conn.execute(
+            "INSERT INTO arbitration (id, created_at, fact_key, left_id, right_id, status) "
+            "VALUES ('arb-1', ?, 'api', 'mem-1', 'mem-2', 'open')",
+            (STAMP,),
+        )
+
+        assert migrate(conn) == [2]
+        assert schema_version(conn) == 2
+        row = conn.execute(
+            "SELECT scope, project_id, visibility, session_id FROM arbitration WHERE id = 'arb-1'"
+        ).fetchone()
+        assert row["scope"] == "project"
+        assert row["project_id"] == "p1"
+        assert row["visibility"] == "shared"
+        assert row["session_id"] == ""
+        assert migrate(conn) == []
+    finally:
+        conn.close()
 
 
 def test_semantic_memory_cannot_be_hard_deleted(conn: sqlite3.Connection) -> None:

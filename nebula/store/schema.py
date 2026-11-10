@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -182,6 +182,7 @@ _P0_STATEMENTS: tuple[str, ...] = (
     )
     """,
     # 同一 fact_key 同时最多一个 open 仲裁：防止"仲裁泛滥"（INV5 四态互斥）
+    # 注意：这个索引只看 fact_key，跨 scope/session 也会互相挡（v2 修掉）
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_arbitration_open ON arbitration (fact_key) "
     "WHERE status = 'open'",
     # 中文 2-gram 倒排索引：content_2gram 是空格分隔的 2-gram 词串（见 core/tokenize.py）
@@ -194,6 +195,33 @@ _P0_STATEMENTS: tuple[str, ...] = (
     """,
 )
 
+_V2_ARBITRATION_SLOT: tuple[str, ...] = (
+    # 仲裁必须落在"槽位 + 分区"上，否则两个项目、两个私有 session 的同名键
+    # 会共用一个 fact_key 全局仲裁（P0 二轮审查 M-1：挑战对子因此静默丢失）
+    "ALTER TABLE arbitration ADD COLUMN scope TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE arbitration ADD COLUMN project_id TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE arbitration ADD COLUMN visibility TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE arbitration ADD COLUMN session_id TEXT NOT NULL DEFAULT ''",
+    # 旧行从对子左侧那条记忆回填，避免历史记录的槽位是空串
+    """
+    UPDATE arbitration SET
+        scope = COALESCE((SELECT scope FROM memories WHERE memories.id = arbitration.left_id), ''),
+        project_id = COALESCE(
+            (SELECT project_id FROM memories WHERE memories.id = arbitration.left_id), ''),
+        visibility = COALESCE(
+            (SELECT visibility FROM memories WHERE memories.id = arbitration.left_id), ''),
+        session_id = COALESCE(
+            (SELECT session_id FROM memories WHERE memories.id = arbitration.left_id), '')
+    """,
+    "DROP INDEX IF EXISTS ux_arbitration_open",
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_arbitration_slot_open
+    ON arbitration (scope, project_id, fact_key, visibility, session_id)
+    WHERE status = 'open'
+    """,
+)
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(version=1, name="p0-base", statements=_P0_STATEMENTS),
+    Migration(version=2, name="arbitration-slot", statements=_V2_ARBITRATION_SLOT),
 )

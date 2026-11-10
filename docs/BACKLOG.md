@@ -35,6 +35,7 @@
 | Q-6 | `events` 没有 `scope` / `visibility` 列 | P0 已把 merge 事件 payload 里的原文改成只存摘要（`incoming_hash`），但表结构本身仍无分区字段；P1 做 `explain` / 导出前必须补列，否则审计表跨 scope 泄漏 |
 | Q-7 | merge 时正文升级到超集后，被覆盖的旧措辞不再单独可查 | 旧措辞是新文的子串，信息没丢，但"当时怎么说的"查不到；P1 若要严格双时间轴，应把旧表述落成 evidence 文本或历史行 |
 | Q-8 | `recall` 不写 `last_recalled` / `recall_count` | 9.2 的晋升触发（`recall_count ≥ 3`）与 9.5 的衰减/auto-archive 全依赖这两个字段。P0 只读，P1 必须补；补的时候要注意"召回写库"仍须经 `write_service` |
+| Q-9 | Windows 下两个进程直连同一个库偶发 `SQLITE_READONLY` / `locked`（实测 1/30 量级） | 目前只在测试 worker 里有界重试（≤5 次 / 退避 50ms），写入层没有重试。P4 daemon 是唯一写者后此场景消失；若坚持支持多进程直写，需在 `write_service` 加有界重试并明确"重试也不改变 INV2/INV3 语义" |
 
 ## 审查记录（P0 首轮，独立会话执行）
 

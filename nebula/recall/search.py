@@ -43,9 +43,14 @@ class Hit:
     pointer_count: int = 0
 
     def format_line(self) -> str:
-        """注入格式（§9.4）：``[decision|user] 内容（id）``。"""
+        """注入格式（§9.4）：``[decision|user] 内容（id）``。
+
+        claim / hypothesis 一律带"未验证"标记——这是防"意见变事实"的最后一道闸，
+        P0 必须先立住格式，P1 接宿主时才有东西可稳定。
+        """
         role = self.role or "unknown"
-        return f"[{self.assertion_type}|{role}] {self.content}（{self.id}）"
+        marker = "|未验证" if self.assertion_type in ("claim", "hypothesis") else ""
+        return f"[{self.assertion_type}|{role}{marker}] {self.content}（{self.id}）"
 
 
 @dataclass(frozen=True)
@@ -69,6 +74,7 @@ class RecallResult:
 class _Candidate:
     hit: Hit
     rank: float
+    slot: str
     doc_tokens: set[str] = field(default_factory=set)
 
 
@@ -149,7 +155,14 @@ def recall(
             seq=int(row["seq"]),
             pinned=pinned,
         )
-        candidates.append(_Candidate(hit=hit, rank=rank_by_id[memory_id], doc_tokens=doc_tokens))
+        candidates.append(
+            _Candidate(
+                hit=hit,
+                rank=rank_by_id[memory_id],
+                slot=_slot_of(row),
+                doc_tokens=doc_tokens,
+            )
+        )
 
     seated, pointers = _select_seats(conn, candidates)
     seated.sort(key=lambda item: (-item.hit.score, item.rank, -item.hit.seq))
@@ -182,6 +195,20 @@ def _ms(started: float) -> float:
     return round((time.perf_counter() - started) * 1000, 3)
 
 
+def _slot_of(row: sqlite3.Row) -> str:
+    """席位 = 作用域内的 fact_key。
+
+    fact_key 只在 scope + project 内唯一（§9.3 P1：两个项目各有一条 build.cmd，
+    不该互相更替）。读路径若只按 fact_key 分组，就把写路径好不容易分开的槽位
+    又合并成一席——p1 的决定会从 top-k 里凭空消失。
+    """
+    fact_key = row["fact_key"]
+    if fact_key is None:
+        return f"__id__:{row['id']}"
+    project = row["project_id"] or ""
+    return f"{row['scope']}\x00{project}\x00{fact_key}"
+
+
 def _fetch_pool(
     conn: sqlite3.Connection,
     ids: tuple[str, ...],
@@ -204,12 +231,12 @@ def _fetch_pool(
         conditions.append("scope = ?")
         params.append(scope)
     if project_id is not None:
-        # 项目视图 = 该项目的条目 + 全局条目
-        conditions.append("(project_id = ? OR project_id IS NULL)")
+        # 项目视图 = 该项目的条目 + 全局条目；scope=host 的条目不属于任何项目
+        conditions.append("(scope = 'global' OR project_id = ?)")
         params.append(project_id)
     sql = (
         "SELECT id, content, assertion_type, asserted_by, fact_key, layer, importance, "
-        "pinned, seq FROM memories WHERE " + " AND ".join(conditions)
+        "pinned, seq, scope, project_id FROM memories WHERE " + " AND ".join(conditions)
     )
     rows: list[sqlite3.Row] = conn.execute(sql, params).fetchall()
     return rows
@@ -231,8 +258,7 @@ def _select_seats(
 ) -> tuple[list[_Candidate], dict[str, int]]:
     groups: dict[str, list[_Candidate]] = {}
     for candidate in candidates:
-        slot = candidate.hit.fact_key or f"__id__:{candidate.hit.id}"
-        groups.setdefault(slot, []).append(candidate)
+        groups.setdefault(candidate.slot, []).append(candidate)
 
     open_pairs = _open_pairs(conn, tuple(candidate.hit.id for candidate in candidates))
     seated: list[_Candidate] = []
@@ -242,10 +268,21 @@ def _select_seats(
         if len(members) == 1:
             seated.append(members[0])
             continue
-        if any(frozenset((left.hit.id, right.hit.id)) in open_pairs for left in members
-               for right in members if left is not right):
-            # 唯一双注入例外：open arbitration 的对子两条都留
-            seated.extend(members)
+        # 唯一双注入例外：仍在 open 仲裁的**对子**两条都留。
+        # 不能"组内有对子就整组放行"——那会给一个槽位开出 3 席，正是 G1 翻车的形态。
+        paired = [
+            member
+            for member in members
+            if any(
+                other is not member
+                and frozenset((member.hit.id, other.hit.id)) in open_pairs
+                for other in members
+            )
+        ]
+        if paired:
+            paired_ids = {member.hit.id for member in paired}
+            seated.extend(paired)
+            dropped.extend(member for member in members if member.hit.id not in paired_ids)
             continue
         members.sort(
             key=lambda item: (

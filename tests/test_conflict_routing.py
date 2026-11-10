@@ -128,10 +128,31 @@ def test_earlier_valid_from_falls_into_history() -> None:
     assert route(new, old).action == ACTION_SUPERSEDE_NEW
 
 
-def test_same_day_falls_back_to_seq() -> None:
-    new = make("observation", seq=2, valid_from="2026-03-01T18:00:00+00:00")
+def test_same_day_different_instants_compare_by_time() -> None:
+    """同日但时刻不同是可比的：否则 18:00 的旧条会被 09:00 的新条"取代"，
+    写出 valid_to 早于 valid_from 的空区间。"""
+    new = make("observation", seq=2, valid_from="2026-03-01T09:00:00+00:00")
+    old = make("observation", seq=1, valid_from="2026-03-01T18:00:00+00:00", content="取值 A")
+    assert route(new, old).action == ACTION_SUPERSEDE_NEW
+
+
+def test_identical_instants_fall_back_to_seq() -> None:
+    new = make("observation", seq=2, valid_from="2026-03-01T09:00:00+00:00")
     old = make("observation", seq=1, valid_from="2026-03-01T09:00:00+00:00", content="取值 A")
     assert route(new, old).action == ACTION_SUPERSEDE_OLD
+
+
+def test_negation_is_not_a_refinement() -> None:
+    """「禁用 GET 方法」与「用 GET 方法」互相包含，但语义是反的，不能 merge。"""
+    new = make("decision", content="用 GET 方法")
+    old = make("decision", seq=1, content="禁用 GET 方法")
+    assert route(new, old).action != ACTION_MERGE
+
+
+def test_superset_with_extra_detail_is_a_refinement() -> None:
+    new = make("decision", content="接口统一用 POST，超时 30 秒")
+    old = make("decision", seq=1, content="接口统一用 POST")
+    assert route(new, old).action == ACTION_MERGE
 
 
 def test_unparsable_time_falls_back_to_seq() -> None:

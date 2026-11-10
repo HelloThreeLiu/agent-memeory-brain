@@ -23,7 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from nebula.core.assertion import rank
-from nebula.core.timeutil import is_before, same_day
+from nebula.core.timeutil import is_before, parse_ts
 
 # A'：只追加，永不仲裁
 ACTION_APPEND = "append"
@@ -87,15 +87,54 @@ def _is_contained_in(part: str, whole: str) -> bool:
     return bool(first) and bool(second) and first in second
 
 
-def _order(new: FactView, old: FactView) -> str:
-    """按 ``valid_from`` 定先后：``later`` / ``earlier`` / ``incomparable``。
+#: 否定标记：包含关系里"多出来的那段"出现这些，就不是补充而是反转
+_NEGATIONS: tuple[str, ...] = ("不", "别", "禁", "勿", "never", "not", "don't", "without")
 
-    同日、无日期、解析失败都算不可比（§9.3 第 2 条），只有不可比才回退 seq。
+
+def _difference(longer: str, shorter: str) -> str:
+    """``longer`` 包含 ``shorter`` 时，返回多出来的那段文字。"""
+    whole = _normalized(longer)
+    part = _normalized(shorter)
+    index = whole.find(part)
+    if index < 0:
+        return whole
+    return whole[:index] + whole[index + len(part) :]
+
+
+def _has_negation(extra: str) -> bool:
+    return any(marker in extra for marker in _NEGATIONS)
+
+
+def is_superset(longer: str, shorter: str) -> bool:
+    """``longer`` 是否完整包含 ``shorter``（规范化后）。合并时用来决定正文是否升级。"""
+    return _is_contained_in(shorter, longer)
+
+
+def _is_pure_refinement(new_content: str, old_content: str) -> bool:
+    """包含关系**且**多出来的部分不含否定词，才算"补充"。
+
+    反例（9.3 P2 明确要排除的）：旧条「禁用 GET 方法」，新条「用 GET 方法」——
+    互相包含，但多出来的是「禁」，语义被反过来了。判成 merge 会把用户的决策
+    当证据吞掉，连 contradicts 都不留。
     """
-    if same_day(new.valid_from, old.valid_from):
-        return "incomparable"
+    if _is_contained_in(new_content, old_content):
+        return not _has_negation(_difference(old_content, new_content))
+    if _is_contained_in(old_content, new_content):
+        return not _has_negation(_difference(new_content, old_content))
+    return False
+
+
+def _order(new: FactView, old: FactView) -> str:
+    """按 ``valid_from`` 的真实时刻定先后：``later`` / ``earlier`` / ``incomparable``。
+
+    只有同一时刻、无日期、解析失败才算不可比，此时才回退 seq。
+    早先按"同一天即不可比"处理会写出 ``valid_to`` 早于 ``valid_from`` 的空区间
+    （18:00 的旧条被 09:00 的新条"取代"），那条历史就成了"从未成立"。
+    """
     latest = is_before(new.valid_from, old.valid_from)
     if latest is None:
+        return "incomparable"
+    if parse_ts(new.valid_from) == parse_ts(old.valid_from):
         return "incomparable"
     return "later" if latest else "earlier"
 
@@ -106,9 +145,9 @@ def route(new: FactView, old: FactView) -> Route:
     if new.scope != old.scope or new.project_id != old.project_id:
         return Route(ACTION_UNRELATED, "P1 不同作用域：不参与路由，各占各的槽位")
 
-    # P2 真互斥还是补充：包含关系（任一方向）走 merge，不当冲突处理
-    if _is_contained_in(new.content, old.content) or _is_contained_in(old.content, new.content):
-        return Route(ACTION_MERGE, "P2 内容包含：合并证据与权重，不失效")
+    # P2 真互斥还是补充：纯补充（含否定词的不算）走 merge，其余进路由
+    if _is_pure_refinement(new.content, old.content):
+        return Route(ACTION_MERGE, "P2 内容包含且无否定词：合并证据与权重，不失效")
 
     # 0) hypothesis 只追加，连跨角色也不仲裁
     if new.assertion_type == "hypothesis":

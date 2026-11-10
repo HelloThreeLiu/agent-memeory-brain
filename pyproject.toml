@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nebula-memory"
+version = "0.0.1"
+description = "本地优先的四层记忆引擎：可追溯、可回滚、零模型也能跑"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["memory", "agent", "sqlite", "fts5", "local-first"]
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+]
+# 硬约束：零运行时依赖（设计文档 §14）。新增依赖须走 WORKFLOW.md 的 L 级流程。
+dependencies = []
+
+[project.scripts]
+nebula = "nebula.__main__:main"
+
+[project.optional-dependencies]
+dev = ["ruff", "mypy", "pytest", "pip-audit", "build"]
+
+[tool.setuptools.packages.find]
+include = ["nebula*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [".workbuddy", ".plans"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+# RUF001/002/003：中文注释里的全角标点是有意的，不是"长得像 ASCII 的坑"
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["nebula"]
+warn_unused_ignores = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

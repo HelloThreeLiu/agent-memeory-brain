@@ -139,6 +139,11 @@ class WriteService:
             raise ValueError("scope=global 时不能带 project_id")
         if scope == "project" and project_id is None:
             raise ValueError("scope=project 时必须带 project_id")
+        if visibility == "private" and not session_id:
+            raise ValueError(
+                "visibility=private 必须带 session_id：否则这条记忆对谁都不在候选集里，"
+                "写进去就再也召回不到"
+            )
 
         # INV6：decision 只能由 role=user 写，agent 写的"结论"最多是 observation
         if assertion_type == "decision" and role != "user":
@@ -220,7 +225,15 @@ class WriteService:
         digest = content_hash(text)
 
         deduped = self._dedupe(
-            digest, scope, project_id, fact_key, created_at, evidence, host, session_id
+            digest,
+            scope,
+            project_id,
+            fact_key,
+            created_at,
+            evidence,
+            host,
+            session_id,
+            visibility,
         )
         if deduped is not None:
             return deduped
@@ -274,8 +287,14 @@ class WriteService:
         evidence: tuple[str, ...],
         host: str | None,
         session_id: str | None,
+        visibility: str,
     ) -> WriteResult | None:
-        """60 秒窗口内的同键同内容 → 合并证据，不新建（§9.1）。"""
+        """60 秒窗口内的同键同内容 → 合并证据，不新建（§9.1）。
+
+        只认**当前有效**的行：写 A → 改 B → 60 秒内又改回 A 时，A 那行已经失效，
+        再"幂等"到它等于把第三次写入静默丢弃（还会把证据写进历史行）。
+        也不跨 visibility / session 合并——那会绕过 INV7 的分区。
+        """
         if fact_key is None:
             return None
         row = self._conn.execute(
@@ -283,9 +302,12 @@ class WriteService:
             SELECT id, seq, created_at, evidence FROM memories
             WHERE fact_key = ? AND content_hash = ? AND scope = ?
               AND COALESCE(project_id, '') = COALESCE(?, '')
+              AND visibility = ? AND COALESCE(session_id, '') = COALESCE(?, '')
+              AND status IN ('active', 'dormant')
+              AND (valid_to IS NULL OR valid_to > ?)
             ORDER BY seq DESC LIMIT 1
             """,
-            (fact_key, digest, scope, project_id),
+            (fact_key, digest, scope, project_id, visibility, session_id, created_at),
         ).fetchone()
         if row is None:
             return None
@@ -326,11 +348,19 @@ class WriteService:
             FROM memories
             WHERE fact_key = ? AND scope = ?
               AND COALESCE(project_id, '') = COALESCE(?, '')
+              AND visibility = ? AND COALESCE(session_id, '') = COALESCE(?, '')
               AND status IN ('active', 'dormant')
               AND (valid_to IS NULL OR valid_to > ?)
             ORDER BY seq DESC LIMIT 1
             """,
-            (draft.fact_key, draft.scope, draft.project_id, draft.created_at),
+            (
+                draft.fact_key,
+                draft.scope,
+                draft.project_id,
+                draft.visibility,
+                draft.session_id,
+                draft.created_at,
+            ),
         ).fetchone()
         if row is None:
             return None
@@ -349,24 +379,41 @@ class WriteService:
         action = decision.action
 
         if action == conflict.ACTION_MERGE:
-            merged = _json_list(
-                self._fetch_evidence(old.id)
-            )
+            merged = _json_list(self._fetch_evidence(old.id))
             for item in draft.evidence:
                 if item not in merged:
                     merged.append(item)
-            self._conn.execute(
-                "UPDATE memories SET evidence = ?, weight = weight + ? WHERE id = ?",
-                (json.dumps(merged, ensure_ascii=False), MERGE_WEIGHT_STEP, old.id),
+            # 新表述更完整（是旧文的超集）时，槽位正文升级成它：信息只增不减
+            upgraded = len(draft.content) > len(old.content) and conflict.is_superset(
+                draft.content, old.content
             )
+            self._conn.execute(
+                "UPDATE memories SET evidence = ?, weight = weight + ?, content = ? WHERE id = ?",
+                (
+                    json.dumps(merged, ensure_ascii=False),
+                    MERGE_WEIGHT_STEP,
+                    draft.content if upgraded else old.content,
+                    old.id,
+                ),
+            )
+            if upgraded:
+                self._rewrite_index(old.id, draft.content)
+            # 没落新行就不该烧掉一个 seq，否则 seq 会留下无主空洞
+            self._conn.execute("UPDATE counter SET value = value - 1 WHERE name = 'seq'")
             self._log_event(
-                draft.seq,
+                old.seq,
                 draft.created_at,
                 draft.host,
                 draft.session_id,
                 "memory.merged",
                 old.id,
-                {"reason": decision.reason, "incoming": draft.content},
+                {
+                    "reason": decision.reason,
+                    # 只存摘要不存正文：events 没有 scope/visibility 列，
+                    # 存原文会让 private 记忆从审计表里漏出去
+                    "incoming_hash": draft.digest,
+                    "upgraded": upgraded,
+                },
             )
             return WriteResult(
                 id=old.id,
@@ -522,6 +569,13 @@ class WriteService:
         if row is None:  # pragma: no cover - 调用方刚查到这一行
             return "[]"
         return str(row["evidence"])
+
+    def _rewrite_index(self, memory_id: str, content: str) -> None:
+        self._conn.execute("DELETE FROM memories_fts WHERE memory_id = ?", (memory_id,))
+        self._conn.execute(
+            "INSERT INTO memories_fts (memory_id, content_2gram) VALUES (?, ?)",
+            (memory_id, index_text(content)),
+        )
 
     def _log_event(
         self,

@@ -32,7 +32,11 @@ def connect(path: str | Path) -> sqlite3.Connection:
         Path(target).expanduser().parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(target, isolation_level=None, timeout=10.0)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode = WAL")
+    # 只在还不是 WAL 时才切：切换日志模式要拿写锁，多进程同时切会撞出
+    # "attempt to write a readonly database"（P4 的 daemon + shim 同样会遇到）
+    mode = conn.execute("PRAGMA journal_mode").fetchone()
+    if mode is None or str(mode[0]).lower() != "wal":
+        conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 10000")

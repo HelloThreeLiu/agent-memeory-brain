@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from nebula.recall.search import recall
 from nebula.store.db import open_database
 from nebula.store.write_service import WriteResult, WriteService
 
@@ -187,6 +188,90 @@ def test_second_challenger_reuses_the_open_arbitration(
     assert first.arbitration_id is not None
     assert second.arbitration_id == first.arbitration_id
     assert conn.execute("SELECT COUNT(*) FROM arbitration").fetchone()[0] == 1
+
+
+def test_merge_upgrades_content_and_rebuilds_index(
+    conn: sqlite3.Connection, write: Callable[..., WriteResult]
+) -> None:
+    """补充细节不该丢：新表述是旧文超集时，槽位正文升级，索引同步重建。"""
+    first = write(
+        "接口统一用 POST", assertion_type="decision", role="user", fact_key="merge.content"
+    )
+    second = write(
+        "接口统一用 POST，超时 30 秒",
+        assertion_type="decision",
+        role="user",
+        fact_key="merge.content",
+    )
+    assert second.action == "merged"
+    content = conn.execute(
+        "SELECT content FROM memories WHERE id = ?", (first.id,)
+    ).fetchone()["content"]
+    assert content == "接口统一用 POST，超时 30 秒"
+    assert recall(conn, "超时 30 秒").hits, "合并后新细节必须能被召回（FTS 要重建）"
+
+
+def test_merge_does_not_burn_a_seq(
+    conn: sqlite3.Connection, write: Callable[..., WriteResult]
+) -> None:
+    first = write("A 事实", fact_key="seq.a")
+    write("A 事实，补充说明", fact_key="seq.a")
+    third = write("B 事实", fact_key="seq.b")
+    assert third.seq == first.seq + 1, "merge 没落新行却消耗了 seq，会留下无主空洞"
+
+
+def test_merge_event_does_not_store_raw_content(
+    conn: sqlite3.Connection, write: Callable[..., WriteResult]
+) -> None:
+    """events 没有 scope/visibility 列，payload 存原文会让 private 记忆从审计表漏出去。"""
+    write("接口统一用 POST", assertion_type="decision", role="user", fact_key="merge.event")
+    write(
+        "接口统一用 POST，超时 30 秒",
+        assertion_type="decision",
+        role="user",
+        fact_key="merge.event",
+    )
+    payload = conn.execute(
+        "SELECT payload FROM events WHERE type = 'memory.merged'"
+    ).fetchone()["payload"]
+    assert "超时 30 秒" not in str(payload)
+
+
+def test_dedupe_ignores_an_already_expired_row(
+    conn: sqlite3.Connection, write: Callable[..., WriteResult]
+) -> None:
+    """A → B → 60 秒内又改回 A：A 那行已失效，幂等进它等于把第三次写入静默丢弃。"""
+    first = write("接口统一用 POST", fact_key="dedupe.expired", now=BASE)
+    write("接口统一改用 GET", fact_key="dedupe.expired", now=BASE + timedelta(seconds=10))
+    third = write(
+        "接口统一用 POST",
+        fact_key="dedupe.expired",
+        evidence=("ep-3",),
+        now=BASE + timedelta(seconds=20),
+    )
+    assert third.action == "supersede_old"
+    assert conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 3
+    evidence = conn.execute(
+        "SELECT evidence FROM memories WHERE id = ?", (first.id,)
+    ).fetchone()["evidence"]
+    assert "ep-3" not in str(evidence), "失效行的证据被后来者污染了"
+
+
+def test_dedupe_does_not_cross_visibility(
+    conn: sqlite3.Connection, write: Callable[..., WriteResult]
+) -> None:
+    private = write(
+        "调试端口 9222", visibility="private", session_id="s-A", fact_key="dedupe.vis"
+    )
+    shared = write("调试端口 9222", fact_key="dedupe.vis")
+    assert shared.action == "created"
+    assert shared.id != private.id
+    assert conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 2
+
+
+def test_private_memory_requires_a_session(service: WriteService) -> None:
+    with pytest.raises(ValueError, match="session_id"):
+        service.remember("私有片段但没有 session", visibility="private", evidence=("ep-1",))
 
 
 def test_two_processes_write_two_hundred_rows_without_holes(tmp_path: Path) -> None:

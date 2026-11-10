@@ -36,6 +36,18 @@ jobs:
           fi
           echo "OK：无本地数据入库"
 
+      - name: 脚本语法检查
+        run: |
+          set -e
+          found=0
+          for f in scripts/*.sh; do
+            [ -e "$f" ] || continue
+            bash -n "$f"
+            echo "OK $f"
+            found=1
+          done
+          [ "$found" -eq 1 ] || echo "跳过：无 shell 脚本"
+
       - name: 静态检查（ruff）
         run: |
           if [ -d nebula ] || [ -d tests ]; then ruff check .; else echo "跳过：尚无 Python 代码"; fi

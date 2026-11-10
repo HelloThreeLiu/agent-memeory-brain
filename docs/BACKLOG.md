@@ -62,7 +62,7 @@
 | M-1 | 仲裁记账按 `fact_key` 全局复用：跨 session 的同名键共用一条仲裁、B 路由顶掉一侧后旧仲裁仍 open，新挑战对子**无任何记账**，召回静默消失 | schema v2（槽位列 + 槽位级 open 唯一索引）+ 复用前校验对子两侧仍 current + 过期对子自动终态（`resolution`=存续侧、`resolved_by=system:b-route`）；两个反例用例先红后绿 |
 | m-1 | merge 升级正文后 `content_hash` 未同步 | 升级分支一并更新 hash；补断言 |
 | m-2 | SQLite 版本下限未声明（`remove_diacritics 2` 需 ≥3.39） | README 注明 |
-| m-3 | `pip-audit` 审计整个共享环境，本机永远无法复现"全绿" | 口径写进 README；改为固定 `.venv` 属流程改动，择期 |
+| m-3 | `pip-audit` 审计整个共享环境，本机永远无法复现"全绿" | CI 改为按 `pyproject.toml` 的 `dependencies` 判空：零依赖跳过（WORKFLOW ④ 原文即"有依赖后"），非空仍审；README 注明本机口径 |
 | n-1 | 「未验证」标记无直接断言 | 补 `Hit.format_line` 用例 |
 | n-2 | `status` 的"当前有效"用 `valid_to IS NULL`，把未来生效行算进来 | 改用候选池同款时间窗谓词 |
 | n-3 | `supersede_new` 的 `supersedes` 边方向写反 | 改为 old→draft，补方向断言 |

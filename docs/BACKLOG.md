@@ -18,7 +18,7 @@
 
 **实测结果（2026-11-10，本机 Python 3.13.12 / SQLite 3.53.1）**
 
-- 门禁：`ruff` 0 问题 / `mypy --strict` 0 问题 / `pytest` 100 passed / `pip-audit` 0 漏洞 / `python -m build` 出 wheel。
+- 门禁：`ruff` 0 问题 / `mypy --strict` 0 问题 / `pytest` 107 passed / `pip-audit` 0 漏洞（项目依赖为空；本机共享环境里的第三方包漏洞不计，见 m-3）/ `python -m build` 出 wheel。
 - 检索基线：200 条种子（40 主题 × 5 措辞）、20 查询，hit@5 **19/20 = 95%**（门槛 70%）；p50 0.4ms、p95 0.63ms（门槛 100ms）。
 - 并发：两进程各写 100 条 → 200 个唯一 id，`seq` = 1..200 无洞（连跑 5 次稳定）。
 - 唯一未命中的查询是「用什么数据库存储数据」——问句太泛，"数据/存储"命中了一堆邻近主题。合成种子的局限，等 P1.5 真实日志再校准。
@@ -34,6 +34,7 @@
 | Q-5 | `memories_fts` 无 contentless-delete，归档条目仍占索引 | 归档动作 P1 才有；届时随 FTS 维护一起改 |
 | Q-6 | `events` 没有 `scope` / `visibility` 列 | P0 已把 merge 事件 payload 里的原文改成只存摘要（`incoming_hash`），但表结构本身仍无分区字段；P1 做 `explain` / 导出前必须补列，否则审计表跨 scope 泄漏 |
 | Q-7 | merge 时正文升级到超集后，被覆盖的旧措辞不再单独可查 | 旧措辞是新文的子串，信息没丢，但"当时怎么说的"查不到；P1 若要严格双时间轴，应把旧表述落成 evidence 文本或历史行 |
+| Q-8 | `recall` 不写 `last_recalled` / `recall_count` | 9.2 的晋升触发（`recall_count ≥ 3`）与 9.5 的衰减/auto-archive 全依赖这两个字段。P0 只读，P1 必须补；补的时候要注意"召回写库"仍须经 `write_service` |
 
 ## 审查记录（P0 首轮，独立会话执行）
 
@@ -54,6 +55,24 @@
 | m-11 | merge 事件 payload 存了原文，审计表跨 scope 泄漏 | payload 只存 `incoming_hash` + 摘要 |
 | n-12 | 注入格式缺「未验证」标记 | claim / hypothesis 一律带 `\|未验证` |
 
+### 二轮审查（独立会话，结论「修复后通过」，阻塞项 M-1）
+
+| 编号 | 问题 | 处理 |
+|---|---|---|
+| M-1 | 仲裁记账按 `fact_key` 全局复用：跨 session 的同名键共用一条仲裁、B 路由顶掉一侧后旧仲裁仍 open，新挑战对子**无任何记账**，召回静默消失 | schema v2（槽位列 + 槽位级 open 唯一索引）+ 复用前校验对子两侧仍 current + 过期对子自动终态（`resolution`=存续侧、`resolved_by=system:b-route`）；两个反例用例先红后绿 |
+| m-1 | merge 升级正文后 `content_hash` 未同步 | 升级分支一并更新 hash；补断言 |
+| m-2 | SQLite 版本下限未声明（`remove_diacritics 2` 需 ≥3.39） | README 注明 |
+| m-3 | `pip-audit` 审计整个共享环境，本机永远无法复现"全绿" | 口径写进 README；改为固定 `.venv` 属流程改动，择期 |
+| n-1 | 「未验证」标记无直接断言 | 补 `Hit.format_line` 用例 |
+| n-2 | `status` 的"当前有效"用 `valid_to IS NULL`，把未来生效行算进来 | 改用候选池同款时间窗谓词 |
+| n-3 | `supersede_new` 的 `supersedes` 边方向写反 | 改为 old→draft，补方向断言 |
+| n-4 | `WriteResult.superseded` 在补录分支装自身 id，命名易误读 | 保留语义，注释写明是"本条已落历史" |
+
+**观察项（已登记为口子，不在本批修）**
+
+1. `recall` 不更新 `last_recalled` / `recall_count` → 9.2 晋升、9.5 衰减全依赖它（Q-8）。
+2. 读路径席位分组不含 visibility/session，写路径路由含 → 跨分区同名键在召回时互相挤席（U8，与 U4 同类，需先定口径）。
+
 ## 待定（等数据，不排期）
 
 | ID | 事项 | 等什么 |
@@ -61,6 +80,7 @@
 | U4 | `private/shared` 分区粒度按 session 还是按角色 | 需要确认 reviewer 是否要看到 writer 的中间推理 |
 | U6 | 是否值得做 `procedure` 通道（双门成本高） | 是否真的存在"被反复确认的工作流" |
 | U7 | 注入信任度降到多少该告警 | P1.5 攒够 300 条注入记录后的负反馈率基线 |
+| U8 | 召回的一席制要不要也按 `visibility` / `session_id` 分席 | 写路径的槽位是本分区内的，读路径分组目前只看 `(scope, project, fact_key)`：同一个共享事实与某个角色的私有片段会互相挤同一席。§9.4 字面可辩护，但多 agent 接入前必须定口径 |
 
 ## 已完成
 

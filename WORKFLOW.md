@@ -34,11 +34,11 @@
 
 | 级别 | 判定标准（满足任一即升级） | 流程要求 |
 |---|---|---|
-| **S** | 单文件 ≤30 行；错别字、注释、文案、单点小修；不碰 schema / 不变量 / 依赖 / 写入路径 | 门禁全绿 → 直接提交 main，无需方案与独立审查 |
+| **S** | 单文件 ≤30 行；错别字、注释、文案、单点小修；不碰 schema / 不变量 / 依赖 / 写入路径 | 门禁全绿 → **快车道 PR**（`scripts/small-change.sh`），免方案与独立审查 |
 | **M** | 多文件功能增量或修复；新增测试；局部重构 | 方案对话中确认 → 分支开发 → 全门禁 → 一轮审查 → 分批提交 |
 | **L** | 新增表/字段/迁移、不变量 INV 变化、写入路径变化、宿主注入契约变化、依赖增删、CI/构建脚本变化、架构重构、发版 | 需求单 → 方案文档 → 分支 → 全门禁 + 专项脚本 → 独立审查（含机械扫描）→ 修复闭环 → 分批提交 → 发布清单 |
 
-**本项目强制按 L 级处理的情形**：`memories` 或任何表结构变化；`INV1–INV12` 的增删改；`write_service` 的写入顺序或事务边界变化；daemon ↔ shim 协议变化；`pyproject.toml` / CI 变化。
+**本项目强制按 L 级处理的情形**：`memories` 或任何表结构变化；`INV1–INV12` 的增删改；`write_service` 的写入顺序或事务边界变化；daemon ↔ shim 协议变化；`pyproject.toml` / `scripts/` / `.github/`（含 rulesets）/ CI 变化。
 
 ---
 
@@ -86,7 +86,7 @@
 git switch -c feat/p0-schema          # 功能：feat/、修复：fix/、杂务：chore/
 ```
 
-S 级可直接在 main 上改。**main 上每个 commit 都必须门禁全绿**，不允许「先合上再修」。
+S 级也**不直推 main**：main 已有分支保护（见 ⑥ 的分支保护小节），S 级走 `scripts/small-change.sh` 快车道——分支、PR、自动合并由脚本一条命令完成。**main 上每个 commit 都必须门禁全绿**，不允许「先合上再修」。
 
 **开发纪律**：
 
@@ -190,7 +190,41 @@ python -m build              # 构建（有 pyproject.toml 后）
 1. `git status` 确认无杂文件；**明确列出文件名** `git add <file>`，不用 `git add -A` / `git add .`；
 2. 标题 ≤50 字说清「做了什么」；正文补「为什么」+ 门禁输出摘要；
 3. M/L 按 ② 的拆分计划分批提交；
-4. M/L：分支 push → 开 PR（CI 跑门禁）→ CI 绿 + 审查闭环 → 合并 → 删分支。S：门禁绿后直接 commit 到 main。
+4. M/L：分支 push → 开 PR（CI 跑门禁）→ CI 绿 + 审查闭环 → 合并 → 删分支。S：`bash scripts/small-change.sh "docs: …" <files>`，一条命令完成分支 → PR → 自动合并。
+
+### 分支保护与豁免判定
+
+`main` 由 ruleset `protect-main`（配置在 `.github/rulesets/protect-main.json`）保护，应用/校验：`bash scripts/setup-branch-protection.sh`。
+
+**开启的规则**
+
+| 规则 | 作用 | 为什么 |
+|---|---|---|
+| Require a pull request | 任何改动必须经 PR | 直推由服务端拒绝，不依赖自觉 |
+| Required approvals = **0** | 不要求审批 | 单人开发无法自审（GitHub 不允许给自己的 PR 批准）；接入第二人或 bot 后改 1 |
+| Require status checks: `gate` | CI 绿才能合 | 与 ④ 四件套一致 |
+| Require branches up to date | 合并前必须与 main 同步 | 防「本地绿、合并后红」 |
+| Block force pushes | 禁强推 | 历史不可改写，双时间轴的可追溯性才成立 |
+| Restrict deletions | 禁删 main | — |
+| Require linear history | 禁 merge commit（只允许 squash / rebase） | 单线历史，便于回溯与 bisect |
+| Bypass list = **空** | 管理员也不能直推 | 严格模式；见下方「如果确实要直推」 |
+
+**大小改动的判定标准**（`small-change.sh` 会机械执行前两行的边界）
+
+| 改动 | 级别 | 豁免什么 | 不豁免什么 |
+|---|---|---|---|
+| 错别字、错链接、注释、README/文档措辞 | S | 方案文档、独立审查 | PR、CI 门禁 |
+| 单文件 ≤30 行的文案或单点修正 | S | 同上 | 同上 |
+| 任何 `nebula/` 下的代码 | M/L | 无 | — |
+| `.github/`、`scripts/`、`pyproject*.toml`、`WORKFLOW.md` | L | 无 | — |
+| 表结构 / INV / 写入路径 / 宿主协议 | L | 无 | — |
+
+**为什么没有「按路径豁免直推」**：GitHub 的分支 ruleset **不支持**用文件路径限定规则的适用范围——路径只能出现在「限制推送内容」类规则里（如禁止某类文件），那是 push ruleset，解决的是"能不能推这种文件"，不是"要不要走 PR"。所以小改动是**免审查**，不是**免流程**。若要真正允许直推，只能把管理员加进 bypass 列表，代价是无法按改动类型区分，等于放弃「禁止直推」这条约束本身。本项目选择不放 bypass。
+
+**如果确实要保留直推（不推荐）**：把 `protect-main.json` 的 `bypass_actors` 改成
+`[{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}]` 后重跑脚本，并补一个 push 审计 workflow：直推触碰 `nebula/` 等代码路径时自动开 issue。此时保护退化为「事后告警」，不再是「事前阻断」。
+
+**关于紧急绕过**：因为不放 bypass，`gh pr merge --admin` 在本仓库会失败——这是设计意图，不是缺陷。真需要直推时，先改 ruleset（这本身是 L 级改动，必然留痕），推完再恢复。
 
 ---
 
@@ -227,7 +261,7 @@ python -m build              # 构建（有 pyproject.toml 后）
 
 | 我要改… | 最小流程 |
 |---|---|
-| 错别字 / 注释 / README | S：改完门禁 → 直接提交 |
+| 错别字 / 注释 / README | S：`small-change.sh`（PR + 自动合并），免审查 |
 | 单点 bug | S~M：门禁 + 专项项 + 补回归用例 |
 | 新增模块 / 表 / 字段 | L：需求单 → 方案 → 分支 → 全门禁 + 迁移用例 → 独立审查 → PR |
 | `INV` 增删改 | L：先改文档与断言测试，再改实现 |

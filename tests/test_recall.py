@@ -73,6 +73,70 @@ def test_expired_version_is_not_in_candidate_pool(
     )
     result = recall(conn, "接口方法", 5)
     assert [hit.content for hit in result.hits] == ["接口方法改用 GET"]
+    # 断言候选数，别让一席制把谓词失效掩盖掉（两条同键最后也会只剩一条）
+    assert result.candidate_count == 1
+
+
+def test_expired_row_without_fact_key_is_excluded(
+    conn: sqlite3.Connection, write: Callable[..., WriteResult]
+) -> None:
+    """没有 fact_key 就没有一席制兜底，谓词坏了会直接进 top-k。"""
+    row = write("孤立条目：调试端口 8080")
+    conn.execute(
+        "UPDATE memories SET valid_to = ? WHERE id = ?", ("2026-01-01T00:00:00+00:00", row.id)
+    )
+    result = recall(conn, "调试端口 8080")
+    assert result.candidate_count == 0
+
+
+def test_seat_is_scoped_by_project(
+    conn: sqlite3.Connection, write: Callable[..., WriteResult]
+) -> None:
+    """两个项目各有一条 build.cmd，读路径不能把它们合并成一席。"""
+    write(
+        "构建命令是 npm run build",
+        assertion_type="decision",
+        role="user",
+        scope="project",
+        project_id="p1",
+        fact_key="build.cmd",
+    )
+    write(
+        "构建命令是 make build",
+        assertion_type="decision",
+        role="user",
+        scope="project",
+        project_id="p2",
+        fact_key="build.cmd",
+    )
+    result = recall(conn, "构建命令", 5)
+    assert len(result.hits) == 2
+    assert {hit.content for hit in result.hits} == {
+        "构建命令是 npm run build",
+        "构建命令是 make build",
+    }
+
+
+def test_host_scope_is_not_in_project_view(
+    conn: sqlite3.Connection, write: Callable[..., WriteResult]
+) -> None:
+    write("本机装了 jq 工具", scope="host", host="pc-1", fact_key="host.jq")
+    write("构建用 make 命令", scope="project", project_id="p1", fact_key="proj.build")
+    assert recall(conn, "本机装了 jq", project_id="p1").hits == ()
+    assert len(recall(conn, "构建用 make", project_id="p1").hits) == 1
+
+
+def test_third_challenger_does_not_open_a_third_seat(
+    conn: sqlite3.Connection, write: Callable[..., WriteResult]
+) -> None:
+    """双注入例外只给"仲裁对子"，同槽位的第三条不能搭便车开第三席。"""
+    write("接口方法定为 POST", assertion_type="decision", role="user", fact_key="arb.seat")
+    write("接口方法其实是 GET", assertion_type="observation", role="agent", fact_key="arb.seat")
+    write("接口方法其实是 PATCH", assertion_type="claim", role="reviewer", fact_key="arb.seat")
+    result = recall(conn, "接口方法", 5)
+    assert len(result.hits) == 2
+    assert {hit.assertion_type for hit in result.hits} == {"decision", "observation"}
+    assert any(hit.pointer_count for hit in result.hits), "落选的异议要给指针，不能静默消失"
 
 
 def test_future_valid_from_is_not_in_candidate_pool(

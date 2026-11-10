@@ -18,9 +18,9 @@
 
 **实测结果（2026-11-10，本机 Python 3.13.12 / SQLite 3.53.1）**
 
-- 门禁：`ruff` 0 问题 / `mypy --strict` 0 问题 / `pytest` 87 passed / `pip-audit` 0 漏洞 / `python -m build` 出 wheel。
-- 检索基线：200 条种子（40 主题 × 5 措辞）、20 查询，hit@5 **19/20 = 95%**（门槛 70%）；p50 0.37ms、p95 0.49ms（门槛 100ms）。
-- 并发：两进程各写 100 条 → 200 个唯一 id，`seq` = 1..200 无洞。
+- 门禁：`ruff` 0 问题 / `mypy --strict` 0 问题 / `pytest` 100 passed / `pip-audit` 0 漏洞 / `python -m build` 出 wheel。
+- 检索基线：200 条种子（40 主题 × 5 措辞）、20 查询，hit@5 **19/20 = 95%**（门槛 70%）；p50 0.4ms、p95 0.63ms（门槛 100ms）。
+- 并发：两进程各写 100 条 → 200 个唯一 id，`seq` = 1..200 无洞（连跑 5 次稳定）。
 - 唯一未命中的查询是「用什么数据库存储数据」——问句太泛，"数据/存储"命中了一堆邻近主题。合成种子的局限，等 P1.5 真实日志再校准。
 
 ## P1 待办（P0 留下的口子，按优先级）
@@ -32,6 +32,27 @@
 | Q-3 | `expand` / `explain` / `forget` / `pin` 工具 | P1 的生命周期与可解释性一起做，单独做会返工 |
 | Q-4 | 检索相关性只算 2-gram 覆盖率，不含词频与长度惩罚 | P0 200 条量级不值得调参；先用真实召回日志看掉不掉点 |
 | Q-5 | `memories_fts` 无 contentless-delete，归档条目仍占索引 | 归档动作 P1 才有；届时随 FTS 维护一起改 |
+| Q-6 | `events` 没有 `scope` / `visibility` 列 | P0 已把 merge 事件 payload 里的原文改成只存摘要（`incoming_hash`），但表结构本身仍无分区字段；P1 做 `explain` / 导出前必须补列，否则审计表跨 scope 泄漏 |
+| Q-7 | merge 时正文升级到超集后，被覆盖的旧措辞不再单独可查 | 旧措辞是新文的子串，信息没丢，但"当时怎么说的"查不到；P1 若要严格双时间轴，应把旧表述落成 evidence 文本或历史行 |
+
+## 审查记录（P0 首轮，独立会话执行）
+
+首轮结论「打回」，12 条发现全部处理；每条都有会红的用例：
+
+| 编号 | 问题 | 处理 |
+|---|---|---|
+| C-1 | 包含关系把否定句判成补充：`禁用 GET 方法` 被 `用 GET 方法` merge 掉 | 加否定词判据，多出来的片段含 不/别/禁/勿/never/not 时不 merge，进路由 |
+| M-2 | 幂等窗口不看 `status`/`valid_to`：A→B→A 会把第三次写入静默丢弃 | 幂等只认同槽位**当前有效**的行 |
+| M-3 | 一席制只按 `fact_key` 分组，跨项目的同名键被合并成一席 | 席位 = (scope, project_id, fact_key) |
+| M-4 | 组内有仲裁对子就整组放行，一个槽位开出 3 席 | 只保留仲裁对子，其余照常抢 1 席并给指针 |
+| M-5 | `valid_to` 谓词没有可红断言（被一席制掩盖） | 补无 `fact_key` 的过期条用例 + 断言 `candidate_count` |
+| M-6 | 同日回退 seq 会写出 `valid_to < valid_from` 的倒挂区间 | 按真实时刻比较，只有时刻相同才回退 seq（设计文档 9.3 同步修正） |
+| m-7 | merge 丢细节、烧 seq | 超集时升级正文并重建 FTS；merge 归还 seq |
+| m-8 | 幂等跨 visibility/session 合并，绕过 INV7 | 幂等与槽位查询都加 visibility/session 过滤 |
+| m-9 | 项目视图把 `scope=host` 的条目一起捞进来 | 条件改为 `scope='global' OR project_id=?` |
+| m-10 | `private` 但无 session 的条目谁都召回不到 | 写入时直接拒绝 |
+| m-11 | merge 事件 payload 存了原文，审计表跨 scope 泄漏 | payload 只存 `incoming_hash` + 摘要 |
+| n-12 | 注入格式缺「未验证」标记 | claim / hypothesis 一律带 `\|未验证` |
 
 ## 待定（等数据，不排期）
 

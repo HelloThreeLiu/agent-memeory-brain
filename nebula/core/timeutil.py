@@ -55,11 +55,3 @@ def is_before(later_candidate: str | None, earlier_candidate: str | None) -> boo
     if left is None or right is None:
         return None
     return left > right
-
-
-def same_day(left: str | None, right: str | None) -> bool:
-    first = parse_ts(left)
-    second = parse_ts(right)
-    if first is None or second is None:
-        return False
-    return first.date() == second.date()

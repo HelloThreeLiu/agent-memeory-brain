@@ -1,0 +1,57 @@
+name: gate
+
+# 门禁：与 WORKFLOW.md ④ 的四件套一致。
+# P0 之前还没有 nebula/ 与 tests/，各步骤带存在性守卫，不会误红；
+# 代码落地后这些守卫会自然生效，无需改本文件。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装门禁工具
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff mypy pytest pip-audit build
+
+      - name: 禁止入库项检查
+        run: |
+          set -e
+          if git ls-files | grep -qE '^\.workbuddy/'; then
+            echo "::error::.workbuddy/ 不应被跟踪"; exit 1
+          fi
+          if git ls-files | grep -qE '\.(db|sqlite|sqlite3)(-wal|-shm)?$'; then
+            echo "::error::记忆库文件不应被跟踪"; exit 1
+          fi
+          echo "OK：无本地数据入库"
+
+      - name: 静态检查（ruff）
+        run: |
+          if [ -d nebula ] || [ -d tests ]; then ruff check .; else echo "跳过：尚无 Python 代码"; fi
+
+      - name: 类型检查（mypy）
+        run: |
+          if [ -d nebula ]; then mypy nebula; else echo "跳过：尚无 nebula/"; fi
+
+      - name: 测试（pytest）
+        run: |
+          if [ -d tests ]; then pytest -q; else echo "跳过：尚无 tests/"; fi
+
+      - name: 依赖审计（pip-audit）
+        run: |
+          if [ -f pyproject.toml ]; then pip-audit; else echo "跳过：尚无 pyproject.toml"; fi
+
+      - name: 构建（python -m build）
+        run: |
+          if [ -f pyproject.toml ]; then python -m build; else echo "跳过：尚无 pyproject.toml"; fi

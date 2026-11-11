@@ -152,8 +152,12 @@
 | review-1 | 首轮审查 12 条修复 | `dd4b40c` / `1061327` / `ab9eb70` |
 | review-2 | 二轮审查 M-1（schema v2 + 仲裁槽位） | `451715a` / `76767ef` |
 | ci | 零依赖时跳过 pip-audit | `427c644` |
-| P1-1 | schema v3：生命周期时间戳 + 审计表分区列 | `0dd7317` |
-| P1-2 | 生命周期写口 + 可复用事务边界 | `8e813f6` |
-| P1-3/P1-4 | 衰减与遗忘阶梯 + 睡眠维护周期 | `49135ee` |
-| P1-5 | 召回记账 / 因子 / expand / explain | `dc3e0f6` |
-| P1-6 | CLI：explain / expand / forget / restore / pin / sleep | `a1ebfba` |
+| P1-1 | schema v3：生命周期时间戳 + 审计表分区列 | `2f1b90f` |
+| P1-2 | 生命周期写口 + 可复用事务边界 | `317c354` |
+| P1-3/P1-4 | 衰减与遗忘阶梯 + 睡眠维护周期 | `30df02b` |
+| P1-5 | 召回记账 / 因子 / expand / explain | `9d26aaf` |
+| P1-6 | CLI：explain / expand / forget / restore / pin / sleep | `cd1a8dc` |
+| P1-7 | 500 轮膨胀测试 + hit@5 门槛收到 90% | `f38cf0d` |
+| P1-8 | 设计文档附录 F + 版本号 0.0.2 | `5a5ab85` |
+| review-3 | P1 审查闭环（M-1/M-2/m-3/m-4/m-5/n-6/n-7） | `b879772` |
+| docs | 审查记录与 R-8 登记 | `2a4df13` |

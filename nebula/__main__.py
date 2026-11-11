@@ -1,6 +1,12 @@
 """命令行入口：``python -m nebula <command>``。
 
-P0 只做四件事：``init`` 建库、``remember`` 写、``recall`` 查、``status`` 看家底。
+P1 起覆盖"能存、能召回、能解释、能忘、能复原"：
+
+- ``init`` / ``remember`` / ``recall`` / ``status``（P0）
+- ``explain`` / ``expand``：为什么召到 / 召不到，一条记忆的完整来历
+- ``forget`` / ``restore`` / ``pin``：生命周期动作
+- ``sleep``：一次维护（``--dry-run`` 只看不改）
+
 断网可用、无 API key 可用——本模块不 import 任何网络或模型库。
 """
 
@@ -14,6 +20,10 @@ from collections.abc import Sequence
 
 from nebula import __version__
 from nebula.core.timeutil import now_ts
+from nebula.lifecycle.decay import plan as lifecycle_plan
+from nebula.lifecycle.sleep import run_sleep
+from nebula.recall.detail import expand
+from nebula.recall.explain import explain
 from nebula.recall.search import recall
 from nebula.store.db import open_database, resolve_db_path, schema_version
 from nebula.store.write_service import InvariantViolation, WriteService
@@ -66,7 +76,48 @@ def build_parser() -> argparse.ArgumentParser:
     recall_parser.add_argument("--project", dest="project_id", default=None)
     recall_parser.add_argument("--session", dest="viewer_session", default=None)
     recall_parser.add_argument("--json", action="store_true", help="输出 JSON")
-    recall_parser.set_defaults(handler=_cmd_recall)
+    recall_parser.add_argument(
+        "--no-record",
+        dest="record",
+        action="store_false",
+        help="不更新 last_recalled / recall_count（只读查询用）",
+    )
+    recall_parser.set_defaults(handler=_cmd_recall, record=True)
+
+    explain_parser = subparsers.add_parser(
+        "explain", help="解释一条记忆为什么召得到 / 召不到"
+    )
+    explain_parser.add_argument("memory_id", help="记忆 id（形如 mem-12）")
+    explain_parser.add_argument("--db", default=None)
+    explain_parser.add_argument("--session", dest="viewer_session", default=None)
+    explain_parser.set_defaults(handler=_cmd_explain)
+
+    expand_parser = subparsers.add_parser("expand", help="展开一条记忆的完整来历")
+    expand_parser.add_argument("memory_id")
+    expand_parser.add_argument("--db", default=None)
+    expand_parser.set_defaults(handler=_cmd_expand)
+
+    forget_parser = subparsers.add_parser("forget", help="遗忘（进回收站，30 天内可复原）")
+    forget_parser.add_argument("memory_id")
+    forget_parser.add_argument("--db", default=None)
+    forget_parser.set_defaults(handler=_cmd_forget)
+
+    restore_parser = subparsers.add_parser("restore", help="从回收站复原")
+    restore_parser.add_argument("memory_id")
+    restore_parser.add_argument("--db", default=None)
+    restore_parser.set_defaults(handler=_cmd_restore)
+
+    pin_parser = subparsers.add_parser("pin", help="置顶（免于自动归档）")
+    pin_parser.add_argument("memory_id")
+    pin_parser.add_argument("--db", default=None)
+    pin_parser.add_argument("--off", action="store_true", help="取消置顶")
+    pin_parser.set_defaults(handler=_cmd_pin)
+
+    sleep_parser = subparsers.add_parser("sleep", help="跑一轮维护：衰减/休眠/归档/清回收站")
+    sleep_parser.add_argument("--db", default=None)
+    sleep_parser.add_argument("--dry-run", action="store_true", help="只报告，不写库")
+    sleep_parser.add_argument("--json", action="store_true")
+    sleep_parser.set_defaults(handler=_cmd_sleep)
 
     status_parser = subparsers.add_parser("status", help="看库的规模与状态")
     status_parser.add_argument("--db", default=None)
@@ -138,6 +189,7 @@ def _cmd_recall(args: argparse.Namespace) -> int:
             scope=args.scope,
             project_id=args.project_id,
             viewer_session=args.viewer_session,
+            record=args.record,
         )
     finally:
         conn.close()
@@ -173,6 +225,95 @@ def _cmd_recall(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_explain(args: argparse.Namespace) -> int:
+    conn = open_database(args.db)
+    try:
+        result = explain(conn, args.memory_id, viewer_session=args.viewer_session)
+    finally:
+        conn.close()
+    for line in result.lines():
+        print(line)
+    return 0
+
+
+def _cmd_expand(args: argparse.Namespace) -> int:
+    conn = open_database(args.db)
+    try:
+        result = expand(conn, args.memory_id)
+    finally:
+        conn.close()
+    for line in result.lines():
+        print(line)
+    return 0
+
+
+def _cmd_forget(args: argparse.Namespace) -> int:
+    conn = open_database(args.db)
+    try:
+        changed = WriteService(conn).forget(args.memory_id)
+    finally:
+        conn.close()
+    if not changed:
+        print(f"{args.memory_id} 已经不在可遗忘状态（可能已在回收站或已归档删除）")
+        return 0
+    print(f"已进回收站：{args.memory_id}（30 天内可 restore）")
+    return 0
+
+
+def _cmd_restore(args: argparse.Namespace) -> int:
+    conn = open_database(args.db)
+    try:
+        changed = WriteService(conn).restore(args.memory_id)
+    finally:
+        conn.close()
+    if not changed:
+        print(f"{args.memory_id} 不在回收站，无需复原")
+        return 0
+    print(f"已复原：{args.memory_id}")
+    return 0
+
+
+def _cmd_pin(args: argparse.Namespace) -> int:
+    conn = open_database(args.db)
+    try:
+        changed = WriteService(conn).pin(args.memory_id, pinned=not args.off)
+    finally:
+        conn.close()
+    action = "取消置顶" if args.off else "置顶"
+    print(f"{action}：{args.memory_id}" if changed else f"{args.memory_id} 状态未变")
+    return 0
+
+
+def _cmd_sleep(args: argparse.Namespace) -> int:
+    conn = open_database(args.db)
+    try:
+        report = run_sleep(conn, dry_run=args.dry_run)
+    finally:
+        conn.close()
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "now": report.now,
+                    "dry_run": report.dry_run,
+                    "scanned": report.scanned,
+                    "heat_settled": report.heat_settled,
+                    "dormant": report.dormant,
+                    "archived": report.archived,
+                    "archived_capacity": report.archived_capacity,
+                    "purged": report.purged,
+                    "active_after": report.active_after,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    for line in report.lines():
+        print(line)
+    return 0
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
     conn = open_database(args.db)
     try:
@@ -198,6 +339,18 @@ def _cmd_status(args: argparse.Namespace) -> int:
             "SELECT COUNT(*) FROM arbitration WHERE status = 'open'"
         ).fetchone()[0]
         print(f"待仲裁：{open_arb}")
+        # 下一轮 sleep 会做什么：让"库会不会膨胀"在跑之前就能看出来
+        pending = lifecycle_plan(conn, now=stamp)
+        print(
+            f"待维护：休眠 {len(pending.to_dormant)} · 归档 {len(pending.to_archive)}"
+            f" · 容量归档 {len(pending.to_archive_capacity)}"
+            f" · 可清回收站 {pending.purgeable}"
+        )
+        recycled = conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE status = 'deleted'"
+        ).fetchone()[0]
+        pinned = conn.execute("SELECT COUNT(*) FROM memories WHERE pinned = 1").fetchone()[0]
+        print(f"回收站：{recycled} · 置顶：{pinned}")
     finally:
         conn.close()
     return 0

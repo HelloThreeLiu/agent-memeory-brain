@@ -120,8 +120,8 @@ def test_migrate_v1_to_v2_backfills_arbitration_slot(tmp_path: Path) -> None:
             (STAMP,),
         )
 
-        assert migrate(conn) == [2]
-        assert schema_version(conn) == 2
+        assert migrate(conn) == [2, 3]
+        assert schema_version(conn) == CURRENT_SCHEMA_VERSION
         row = conn.execute(
             "SELECT scope, project_id, visibility, session_id FROM arbitration WHERE id = 'arb-1'"
         ).fetchone()
@@ -130,6 +130,47 @@ def test_migrate_v1_to_v2_backfills_arbitration_slot(tmp_path: Path) -> None:
         assert row["visibility"] == "shared"
         assert row["session_id"] == ""
         assert migrate(conn) == []
+    finally:
+        conn.close()
+
+
+def test_migrate_v2_to_v3_adds_lifecycle_and_backfills_events(tmp_path: Path) -> None:
+    """旧库升级：v3 加生命周期时间戳，并把审计事件按 target 回填分区列（Q-6）。"""
+    path = tmp_path / "v2.db"
+    conn = connect(path)
+    try:
+        assert migrate(conn, target=2) == [1, 2]
+        memory_id = insert_memory(conn, 1, scope="project", project_id="p1", content="私有片段")
+        conn.execute(
+            "UPDATE memories SET visibility = 'private', session_id = 's1' WHERE id = ?",
+            (memory_id,),
+        )
+        conn.execute(
+            "INSERT INTO events (seq, ts, type, target) VALUES (1, ?, 'memory.created', ?)",
+            (STAMP, memory_id),
+        )
+        event_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(events)")}
+        assert "scope" not in event_columns
+
+        assert migrate(conn) == [3]
+        row = conn.execute(
+            "SELECT scope, visibility FROM events WHERE target = ?", (memory_id,)
+        ).fetchone()
+        assert row["scope"] == "project"
+        assert row["visibility"] == "private"
+
+        memory_columns = {str(item[1]) for item in conn.execute("PRAGMA table_info(memories)")}
+        assert {"archived_at", "deleted_at", "decayed_at"} <= memory_columns
+        fresh = conn.execute(
+            "SELECT archived_at, deleted_at, decayed_at FROM memories WHERE id = ?", (memory_id,)
+        ).fetchone()
+        assert fresh["archived_at"] is None
+        assert fresh["deleted_at"] is None
+        assert fresh["decayed_at"] is None
+
+        # 回填只该在迁移事务里发生一次，装回触发器后 events 仍然 append-only
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("UPDATE events SET type = 'tampered'")
     finally:
         conn.close()
 

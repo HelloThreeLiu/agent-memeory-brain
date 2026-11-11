@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -221,7 +221,39 @@ _V2_ARBITRATION_SLOT: tuple[str, ...] = (
     """,
 )
 
+_V3_LIFECYCLE: tuple[str, ...] = (
+    # 生命周期时间戳。三个都不能从既有列推出来：
+    # - archived_at：归档后可一键复原，且 sleep 报告要按归档批次聚合
+    # - deleted_at：回收站窗口从"进回收站"起算，不是从 created_at/expired_at 起算
+    # - decayed_at：heat 必须相对上次结算时间衰减，否则每跑一次 sleep 就多衰减一轮
+    "ALTER TABLE memories ADD COLUMN archived_at TEXT",
+    "ALTER TABLE memories ADD COLUMN deleted_at TEXT",
+    "ALTER TABLE memories ADD COLUMN decayed_at TEXT",
+    # Q-6：审计表没有分区列，explain / 导出会把 private 条目的事件漏给别的 scope。
+    # events 是 append-only（UPDATE 触发器），回填前只能临时摘掉再装回去。
+    "DROP TRIGGER IF EXISTS trg_events_no_update",
+    "ALTER TABLE events ADD COLUMN scope TEXT",
+    "ALTER TABLE events ADD COLUMN visibility TEXT",
+    """
+    UPDATE events SET
+        scope = (SELECT scope FROM memories WHERE memories.id = events.target),
+        visibility = (SELECT visibility FROM memories WHERE memories.id = events.target)
+    WHERE EXISTS (SELECT 1 FROM memories WHERE memories.id = events.target)
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_events_no_update
+    BEFORE UPDATE ON events
+    FOR EACH ROW
+    BEGIN
+        SELECT RAISE(ABORT, 'events 是 append-only，不允许 UPDATE');
+    END
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_memories_lifecycle ON memories (status, archived_at)",
+    "CREATE INDEX IF NOT EXISTS ix_memories_recall ON memories (last_recalled)",
+)
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(version=1, name="p0-base", statements=_P0_STATEMENTS),
     Migration(version=2, name="arbitration-slot", statements=_V2_ARBITRATION_SLOT),
+    Migration(version=3, name="lifecycle", statements=_V3_LIFECYCLE),
 )

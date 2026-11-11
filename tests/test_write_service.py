@@ -474,3 +474,49 @@ def test_failed_write_rolls_back_completely(conn: sqlite3.Connection) -> None:
     assert conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
     assert service.remember("失败之后的第一条", evidence=("ep-1",)).seq == 1
+
+
+class _FlakyConnection:
+    """只代理 WriteService 用到的两处：``in_transaction`` 与 ``execute``。"""
+
+    def __init__(self, real: sqlite3.Connection, failures: int, message: str) -> None:
+        self._real = real
+        self.remaining = failures
+        self.attempts = 0
+        self._message = message
+
+    @property
+    def in_transaction(self) -> bool:
+        return self._real.in_transaction
+
+    def execute(self, sql: str, *args: object) -> sqlite3.Cursor:
+        if sql == "BEGIN IMMEDIATE":
+            self.attempts += 1
+            if self.remaining > 0:
+                self.remaining -= 1
+                raise sqlite3.OperationalError(self._message)
+        return self._real.execute(sql, *args)
+
+
+def test_begin_retries_transient_lock_without_losing_the_write(
+    conn: sqlite3.Connection,
+) -> None:
+    """开事务撞 locked 时重试；重试范围只有 BEGIN，不会重放已执行的语句。"""
+    flaky = _FlakyConnection(conn, failures=2, message="database is locked")
+    service = WriteService(flaky)  # type: ignore[arg-type]
+
+    result = service.remember("重试之后仍然要写进去", evidence=("ep-1",), now=BASE)
+
+    assert result.action == "created"
+    assert flaky.remaining == 0
+    assert flaky.attempts == 3, "两次 locked + 一次成功，说明确实重试了而不是放弃"
+    assert conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 1
+
+
+def test_begin_does_not_retry_non_transient_errors(conn: sqlite3.Connection) -> None:
+    flaky = _FlakyConnection(conn, failures=99, message="no such table: nope")
+    service = WriteService(flaky)  # type: ignore[arg-type]
+
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        service.remember("不该被吞掉", evidence=("ep-1",), now=BASE)
+    assert flaky.attempts == 1, "非瞬态错误必须当场抛出，不能重试五次才失败"

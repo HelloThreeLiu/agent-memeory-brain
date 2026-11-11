@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from nebula.core.timeutil import fmt
+from nebula.core.timeutil import fmt, parse_ts
 from nebula.store.write_service import WriteResult, WriteService
 
 T0 = datetime(2026, 5, 1, 9, 0, tzinfo=UTC)
@@ -264,7 +264,10 @@ def test_resolve_left_retires_the_challenger(
 
     assert winner == keeper.id
     loser = memory_row(conn, challenger.id)
-    assert loser["valid_to"] == fmt(at(0))  # 止于赢家生效时刻
+    # 赢家更早生效（旧条胜出）：输家从自己生效撑到被裁决为止，
+    # 而不是倒挂成"从未成立"（审查 M-1）
+    assert loser["valid_to"] == fmt(at(2))
+    assert parse_ts(loser["valid_to"]) >= parse_ts(loser["valid_from"])
     assert loser["expired_at"] == fmt(at(2))
     assert loser["superseded_by"] == keeper.id
     assert loser["status"] == "active"  # observation 输掉不归档，只是退出当前区间
@@ -275,6 +278,37 @@ def test_resolve_left_retires_the_challenger(
     assert arb["status"] == "resolved"
     assert arb["resolution"] == "left"
     assert arb["resolved_by"] == "user"
+
+
+def test_resolve_right_truncates_at_the_winner_start(
+    conn: sqlite3.Connection, service: WriteService
+) -> None:
+    """claim 胜出（新压旧）：旧条止于新条生效时刻，区间同样不许倒挂。"""
+    keeper = service.remember(
+        "数据库用 SQLite",
+        fact_key="db.engine.claimwin",
+        assertion_type="decision",
+        role="user",
+        evidence=("ep-1",),
+        now=at(0),
+    )
+    claim = service.remember(
+        "数据库改用 PostgreSQL",
+        fact_key="db.engine.claimwin",
+        assertion_type="claim",
+        role="agent",
+        evidence=("ep-2",),
+        now=at(1),
+    )
+    assert claim.arbitration_id is not None
+
+    assert service.resolve_arbitration(claim.arbitration_id, "right", now=at(2)) == claim.id
+
+    loser = memory_row(conn, keeper.id)
+    assert loser["valid_to"] == fmt(at(1))
+    assert parse_ts(loser["valid_to"]) >= parse_ts(loser["valid_from"])
+    # 输家是 decision，不是 claim，所以只退场不归档
+    assert loser["status"] == "active"
 
 
 def test_resolve_refutes_a_losing_claim(conn: sqlite3.Connection, service: WriteService) -> None:
@@ -356,3 +390,30 @@ def test_resolve_tolerates_already_expired_loser(
 def test_resolve_refuses_unknown_arbitration(conn: sqlite3.Connection) -> None:
     with pytest.raises(ValueError, match="没有这条仲裁"):
         WriteService(conn).resolve_arbitration("arb-404", "left")
+
+
+def test_sweep_status_moves_rows_to_the_recycle_bin(
+    conn: sqlite3.Connection, write: Callable[..., WriteResult]
+) -> None:
+    """批量 deleted 分支也要真的能用（审查 n-7：原本无调用也无用例）。"""
+    first = write("批量遗忘 A", now=at(0))
+    second = write("批量遗忘 B", now=at(0))
+    service = WriteService(conn)
+
+    assert service.sweep_status([first.id, second.id], "deleted", now=at(1)) == 2
+
+    for memory_id in (first.id, second.id):
+        row = memory_row(conn, memory_id)
+        assert row["status"] == "deleted"
+        assert row["deleted_at"] == fmt(at(1))
+        assert fts_rows(conn, memory_id) == 0
+
+
+def test_sweep_status_rejects_targets_outside_the_whitelist(
+    conn: sqlite3.Connection, write: Callable[..., WriteResult]
+) -> None:
+    item = write("不该被批量复活", now=at(0))
+    with pytest.raises(ValueError, match="不支持目标状态"):
+        WriteService(conn).sweep_status([item.id], "active")
+    assert memory_row(conn, item.id)["status"] == "active"
+

@@ -38,12 +38,12 @@
 
 **实测结果（2026-11-11，本机 Python 3.13.14 / SQLite 3.53.1）**
 
-- 门禁：`ruff` 0 问题 / `mypy --strict` 0 问题 / `pytest` **170 passed** / `python -m build` 出 wheel（零运行时依赖，`pip-audit` 按 CI 口径跳过）。
+- 门禁：`ruff` 0 问题 / `mypy --strict` 0 问题 / `pytest` **178 passed**（审查修复后复跑）/ `python -m build` 出 wheel（零运行时依赖，`pip-audit` 按 CI 口径跳过）。
 - 检索基线：20 查询 hit@5 **19/20 = 95%**，与 P0 完全一致——加 weight/confidence 两项因子没掉点；p50 0.34ms、p95 0.49ms（`record=False`，纯检索）。
 - 500 轮压测（每轮 3 写 + 1 召回，每 50 轮一次 sleep，共 1500 条、时间跨度 1500 天）：总量 1500 一条不丢；活跃 **270**（把软上限压到 300 来测容量机制）；归档 1230（`capacity` 1036 / `decay` 194）；FTS 行数 = 活跃条数（归档条目不占索引）。
 - 回收站往返：29 天可复原、31 天拒绝；`purge_expired` 只删超期行，且先清 links / arbitration 再删主体。
 - 仲裁终态：left/right 输家退出当前区间但行保留、claim 输家转 `archived(refuted)`、`both` 两条都不动、重复裁决被拒、输家已失效时不撞 INV3 触发器。
-- 全量跑测试时偶发一次并发用例 `SQLITE_READONLY`（单跑 5/5 绿），仍是 Q-9 那条 Windows 多进程已知问题。
+- 全量跑测试时偶发一次并发用例 `SQLITE_READONLY`（单跑 5/5 绿），是 Q-9 那条 Windows 多进程已知问题；审查修复批次已补 `BEGIN` 有界重试。
 
 ## 原 P1 口子（Q-1..Q-9）的收口
 
@@ -57,7 +57,7 @@
 | Q-6 | **已收口**。`events` 补 `scope` / `visibility`，v3 迁移按 `target` 回填，装回 append-only 触发器后仍拒绝篡改 |
 | Q-7 | 未做。merge 升级正文后旧措辞仍不可单独查；严格双时间轴要把它落成 evidence 文本或历史行，等 P1.5 真实数据看是否值得 |
 | Q-8 | **已收口**。命中写 `last_recalled` / `recall_count`，dormant 命中即唤醒；写仍经 `write_service` |
-| Q-9 | 未做。`write_service` 没有跨进程重试；P4 daemon 成为唯一写者后此场景消失 |
+| Q-9 | **已收口**。`BEGIN IMMEDIATE` 加有界重试（5 次 / 线性退避），只包"开事务"这一步——语句已执行再重试等于重放半截写入；非瞬态错误当场抛（`attempts == 1` 断言）。P4 daemon 成为唯一写者后这层重试可以删掉 |
 
 ## P1 留下的口子（按优先级）
 
@@ -70,6 +70,24 @@
 | R-5 | `resolution=merged` | §9.3 未定义合并后正文归属 |
 | R-6 | 快照 JSON | P2 星图才消费 |
 | R-7 | 半衰期分档表的真实校准 | 现为先验值，需要 P1.5 的召回日志 |
+| R-8 | `explain` / `expand` 输出不按 viewer/scope 过滤；`events` 的分区列暂无读路径消费 | P1 审查 n-8：与 U4/U8 开放口径一致，不算新洞；但 P1.5 把 expand 变成 agent 工具时即成跨 session 泄漏面，接宿主前必须先定口径 |
+
+## 审查记录（P1，独立会话执行）
+
+原始报告 `.reviews/CODE-REVIEW-P1-lifecycle-2026-11-11.md`（过程稿，不入库）。结论「修复后通过」，**M-1 / M-2 阻塞合并**。以下每条都有会红的用例或实跑输出，不采信"已修好"。
+
+| 编号 | 级别 | 问题 | 处理 | 验证证据 |
+|---|---|---|---|---|
+| M-1 | **Major** | 裁决终态在"旧条胜出"时写出倒挂区间：`valid_to` 无条件取赢家 `valid_from`，观测条挑战 decision、用户裁 left 时得到 `valid_to < valid_from`，这条历史成了"从未成立"且被 INV3 触发器锁死 | **先改规格再改实现**：§9.3 新增「终态的区间几何」三档；`_retire_boundary` 按几何取边界（赢家更晚→赢家生效时刻；赢家更早→裁决时刻；缺失/异常→裁决时刻），硬约束 `valid_to >= 输家 valid_from` | repro A：loser `2026-05-02 → 2026-05-03`，`valid_to >= valid_from = True`；新增 `test_resolve_right_truncates_at_the_winner_start` 覆盖"新压旧"几何 |
+| M-2 | **Major** | `explain._seat_blocker` 与召回自相矛盾：忽略 open 仲裁双注入、同档用 `seq` 定席（召回用综合分）、偷用 `now_ts()` 不接 `now` | 重写为 `_seat_check`：① 先查 open 对子，命中则豁免并给出"双注入例外"理由；② 时间基统一用传入 `now`；③ 同档只提示不拦（无查询语境算不出 relevance） | repro B：`explain(claim).recallable=True`，理由「与 mem-5 在 open 仲裁中：一席制双注入例外」；新增 3 条用例，其中 `test_explain_honours_double_injection...` 断言 explain 与 recall 结果同口径 |
+| m-3 | Minor | `purge_expired` 预读在事务外、DELETE 不复核 status；并发 `restore` 后可能硬删刚复原的记忆 | 预读挪进 `BEGIN IMMEDIATE` 之后；DELETE 追加 `status='deleted' AND deleted_at <= cutoff` | purge 用例（29/31 天边界、先清外键）全绿 |
+| m-4 | Minor | 记账阈值与 Q-8 口径不符：弱命中（0.10–0.25）已注入却不计 `recall_count` | 拆开两件事：`touch_recall(wake_ids=...)` 全量记账、仅达阈值者唤醒 | `test_recall_records_weak_hits_without_waking_them`：`recall_count=1` 且 `status` 仍 `dormant` |
+| m-5 | Minor | 容量候选含 dormant、水位只数 active：最冷的几乎总是 dormant，先埋能唤醒的条目，active 不降、跨轮不收敛 | 候选池只取 `active`，并排除本轮将休眠/归档的条目，与水位口径一致 | `test_capacity_only_buries_active_rows_not_dormant`：3 条更冷的 dormant 一条不动，归档 3 条 active |
+| n-6 | Nit | `except` 里 ROLLBACK 未判 `in_transaction`，SQLITE_FULL/IOERR 类错误会顶掉原始异常 | 加守卫 | 全量用例绿 |
+| n-7 | Nit | `sweep_status` 的 `deleted` 分支无生产调用、无用例 | 补两条用例（正向落库 + 白名单拒绝） | `test_sweep_status_moves_rows_to_the_recycle_bin` / `..._rejects_targets_outside_the_whitelist` |
+| n-8 | Nit | explain/expand 不按 viewer/scope 过滤；events 分区列暂无读路径消费 | 不改，与 U4/U8 口径一致 | 登记为 R-8 |
+
+**修复后复验（2026-11-11）**：`ruff` 0 / `mypy` 0（20 文件）/ `pytest` **178 passed** / 16 格路由表 **38 passed** / 仲裁三态 **8 passed** / `python -m build` 出 `nebula_memory-0.0.2` wheel。
 
 ## 审查记录（P0 首轮，独立会话执行）
 

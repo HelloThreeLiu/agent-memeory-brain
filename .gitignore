@@ -4,6 +4,9 @@
 # 方案文档暂存（见 WORKFLOW.md ②）
 .plans/
 
+# 代码审查过程稿（见 WORKFLOW.md ⑤：默认不入库，结论压缩进提交说明）
+.reviews/
+
 # Python
 __pycache__/
 *.py[cod]

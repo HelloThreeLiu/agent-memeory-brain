@@ -3,7 +3,7 @@
 > 规则见 `WORKFLOW.md` ①：M/L 级需求必须登记在这里，不允许只存在于对话或记忆里。
 > 状态：`todo` / `doing` / `blocked` / `done`。
 
-## 当前批次：P0 骨架（目标：能存、能召回、能断言）—— 已收口
+## 上批：P0 骨架（目标：能存、能召回、能断言）—— 已收口
 
 | ID | 类型 | 级别 | 事项 | 验收标准 | 状态 |
 |---|---|---|---|---|---|
@@ -23,19 +23,53 @@
 - 并发：两进程各写 100 条 → 200 个唯一 id，`seq` = 1..200 无洞（连跑 5 次稳定）。
 - 唯一未命中的查询是「用什么数据库存储数据」——问句太泛，"数据/存储"命中了一堆邻近主题。合成种子的局限，等 P1.5 真实日志再校准。
 
-## P1 待办（P0 留下的口子，按优先级）
+## 当前批次：P1 生命周期（目标：会忘、能复原、能追责）—— 已收口
 
-| ID | 事项 | 为什么 P0 不做 |
+| ID | 类型 | 级别 | 事项 | 验收标准 | 状态 |
+|---|---|---|---|---|---|
+| P1-1 | feat(schema) | L | schema v3：`memories` 补 `archived_at` / `deleted_at` / `decayed_at`，`events` 补 `scope` / `visibility` | v2→v3 旧库升级用例；文档 DDL 同步门禁绿 | done |
+| P1-2 | feat(store) | L | 生命周期写口：`touch_recall` / `pin` / `archive` / `unarchive` / `forget` / `restore` / `purge_expired` / `resolve_arbitration` | 每个动作有状态 + FTS + 审计事件三件套断言 | done |
+| P1-3 | feat(lifecycle) | L | 衰减与遗忘阶梯：heat 半衰期、dormant、auto-archive、回收站、容量上限 | 时间可注入；`pinned` 全程豁免；只用 `now` 参数就能模拟 180 天 | done |
+| P1-4 | feat(lifecycle) | L | 睡眠维护周期：单事务、dry-run、报告、幂等、失败整体回滚 | 中途抛错时 heat 也回滚；连跑两次第二次不动 | done |
+| P1-5 | feat(recall) | L | 召回记账（Q-8）、weight/confidence 因子、`expand`、`explain` | 命中才记账；`record=False` 只读；explain 覆盖四道闸 | done |
+| P1-6 | feat(cli) | M | `explain` / `expand` / `forget` / `restore` / `pin` / `sleep` | 断网、零 API key 可用 | done |
+| P1-7 | test(lifecycle) | L | 500 轮连续使用不膨胀 | 活跃条数钉在软上限；总量零丢失；后段注入规模与耗时持平 | done |
+| P1-8 | docs(design) | S | 附录 F：P1 落地范围与偏差 | 未落地项逐条给理由 | done |
+
+**实测结果（2026-11-11，本机 Python 3.13.14 / SQLite 3.53.1）**
+
+- 门禁：`ruff` 0 问题 / `mypy --strict` 0 问题 / `pytest` **170 passed** / `python -m build` 出 wheel（零运行时依赖，`pip-audit` 按 CI 口径跳过）。
+- 检索基线：20 查询 hit@5 **19/20 = 95%**，与 P0 完全一致——加 weight/confidence 两项因子没掉点；p50 0.34ms、p95 0.49ms（`record=False`，纯检索）。
+- 500 轮压测（每轮 3 写 + 1 召回，每 50 轮一次 sleep，共 1500 条、时间跨度 1500 天）：总量 1500 一条不丢；活跃 **270**（把软上限压到 300 来测容量机制）；归档 1230（`capacity` 1036 / `decay` 194）；FTS 行数 = 活跃条数（归档条目不占索引）。
+- 回收站往返：29 天可复原、31 天拒绝；`purge_expired` 只删超期行，且先清 links / arbitration 再删主体。
+- 仲裁终态：left/right 输家退出当前区间但行保留、claim 输家转 `archived(refuted)`、`both` 两条都不动、重复裁决被拒、输家已失效时不撞 INV3 触发器。
+- 全量跑测试时偶发一次并发用例 `SQLITE_READONLY`（单跑 5/5 绿），仍是 Q-9 那条 Windows 多进程已知问题。
+
+## 原 P1 口子（Q-1..Q-9）的收口
+
+| ID | 处置 |
+|---|---|
+| Q-1 | **已收口**。`resolve_arbitration` 落 §9.3 三态终态；`merged` 显式拒绝（§9.3 未定义正文归属） |
+| Q-2 | 不修。进程内单写者 + SQLite 事务串行化，真唯一写者是 P4 |
+| Q-3 | **已完成**。`expand` / `explain` / `forget` / `pin` 全部落地 |
+| Q-4 | **部分**。开了 weight（0.10）与 confidence（0.08）；时近性（0.14）有意不开，理由见设计文档附录 F.3 |
+| Q-5 | **已收口**。归档/删除/复原与状态变更在同一事务里维护 FTS；500 轮用例断言 FTS 行数 = 活跃条数 |
+| Q-6 | **已收口**。`events` 补 `scope` / `visibility`，v3 迁移按 `target` 回填，装回 append-only 触发器后仍拒绝篡改 |
+| Q-7 | 未做。merge 升级正文后旧措辞仍不可单独查；严格双时间轴要把它落成 evidence 文本或历史行，等 P1.5 真实数据看是否值得 |
+| Q-8 | **已收口**。命中写 `last_recalled` / `recall_count`，dormant 命中即唤醒；写仍经 `write_service` |
+| Q-9 | 未做。`write_service` 没有跨进程重试；P4 daemon 成为唯一写者后此场景消失 |
+
+## P1 留下的口子（按优先级）
+
+| ID | 事项 | 为什么 P1 不做 |
 |---|---|---|
-| Q-1 | 仲裁未裁决期间同槽位多条 current：`_current_in_slot` 取 `seq` 最新的一条做路由基准 | 收口要等仲裁终态（9.3 的 resolution 落地）才有意义；P0 只如实记账、不猜 |
-| Q-2 | INV1 只有"进程内单写者"：跨进程靠 SQLite 事务串行化 | 真 daemon + shim 是 P4；现在写"已兑现唯一写者"是自我美化 |
-| Q-3 | `expand` / `explain` / `forget` / `pin` 工具 | P1 的生命周期与可解释性一起做，单独做会返工 |
-| Q-4 | 检索相关性只算 2-gram 覆盖率，不含词频与长度惩罚 | P0 200 条量级不值得调参；先用真实召回日志看掉不掉点 |
-| Q-5 | `memories_fts` 无 contentless-delete，归档条目仍占索引 | 归档动作 P1 才有；届时随 FTS 维护一起改 |
-| Q-6 | `events` 没有 `scope` / `visibility` 列 | P0 已把 merge 事件 payload 里的原文改成只存摘要（`incoming_hash`），但表结构本身仍无分区字段；P1 做 `explain` / 导出前必须补列，否则审计表跨 scope 泄漏 |
-| Q-7 | merge 时正文升级到超集后，被覆盖的旧措辞不再单独可查 | 旧措辞是新文的子串，信息没丢，但"当时怎么说的"查不到；P1 若要严格双时间轴，应把旧表述落成 evidence 文本或历史行 |
-| Q-8 | `recall` 不写 `last_recalled` / `recall_count` | 9.2 的晋升触发（`recall_count ≥ 3`）与 9.5 的衰减/auto-archive 全依赖这两个字段。P0 只读，P1 必须补；补的时候要注意"召回写库"仍须经 `write_service` |
-| Q-9 | Windows 下两个进程直连同一个库偶发 `SQLITE_READONLY` / `locked`（实测 1/30 量级） | 目前只在测试 worker 里有界重试（≤5 次 / 退避 50ms），写入层没有重试。P4 daemon 是唯一写者后此场景消失；若坚持支持多进程直写，需在 `write_service` 加有界重试并明确"重试也不改变 INV2/INV3 语义" |
+| R-1 | L3 写入管道（episode 切段）与由此而来的睡眠 ①②③ | 没有输入的处理是空转；等 P1.5 接宿主后按真实回合切 |
+| R-2 | 复核队列与 `stale` 标记 | `stale` 要先有 confidence 下降的来源（删 L3 的传播），同样依赖 R-1 |
+| R-3 | 孤立节点降权 | "孤立"口径未定（无 `derived_from` / 无 `evidence` / 入度 0）。P0 数据几乎全是孤立点，现在降权等于全库降权 |
+| R-4 | 时近性因子 | 会惩罚长期有效的 decision，与 G1 冲突；`last_recalled` 数据太新 |
+| R-5 | `resolution=merged` | §9.3 未定义合并后正文归属 |
+| R-6 | 快照 JSON | P2 星图才消费 |
+| R-7 | 半衰期分档表的真实校准 | 现为先验值，需要 P1.5 的召回日志 |
 
 ## 审查记录（P0 首轮，独立会话执行）
 
@@ -100,3 +134,8 @@
 | review-1 | 首轮审查 12 条修复 | `dd4b40c` / `1061327` / `ab9eb70` |
 | review-2 | 二轮审查 M-1（schema v2 + 仲裁槽位） | `451715a` / `76767ef` |
 | ci | 零依赖时跳过 pip-audit | `427c644` |
+| P1-1 | schema v3：生命周期时间戳 + 审计表分区列 | `0dd7317` |
+| P1-2 | 生命周期写口 + 可复用事务边界 | `8e813f6` |
+| P1-3/P1-4 | 衰减与遗忘阶梯 + 睡眠维护周期 | `49135ee` |
+| P1-5 | 召回记账 / 因子 / expand / explain | `dc3e0f6` |
+| P1-6 | CLI：explain / expand / forget / restore / pin / sleep | `a1ebfba` |

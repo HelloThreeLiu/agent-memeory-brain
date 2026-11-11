@@ -27,25 +27,31 @@ def test_seed_set_has_two_hundred_rows(seeded: int) -> None:
     assert seeded == 200
 
 
-def test_fixed_query_set_hit_rate_at_least_seventy_percent(
+def test_fixed_query_set_hit_rate_stays_at_baseline(
     conn: sqlite3.Connection, seeded: int
 ) -> None:
-    """20 个查询、top-5 里出现目标主题即算命中。合成数据基线，不是真实场景结论。"""
+    """20 个查询、top-5 里出现目标主题即算命中。
+
+    P0 与 P1（加 weight/confidence 因子后）实测都是 19/20 = 95%。门槛钉在 90%
+    而不是 70%：允许 2 条因合成种子太泛而失手，但不允许打分改动悄悄掉点。
+    合成数据基线不是真实场景结论。
+    """
     hits = 0
     misses: list[str] = []
     for query, slug in QUERIES:
-        result = recall(conn, query, 5)
+        result = recall(conn, query, 5, record=False)
         if any(f"【{slug}】" in hit.content for hit in result.hits):
             hits += 1
         else:
             misses.append(f"{query} → {slug}")
-    assert hits / len(QUERIES) >= 0.70, f"命中 {hits}/{len(QUERIES)}；未命中：{misses}"
+    assert hits / len(QUERIES) >= 0.90, f"命中 {hits}/{len(QUERIES)}；未命中：{misses}"
 
 
 def test_recall_is_fast_enough(conn: sqlite3.Connection, seeded: int) -> None:
+    """这里测纯检索（``record=False``）；含记账的端到端耗时在 500 轮压测里覆盖。"""
     timings: list[float] = []
     for query, _slug in QUERIES:
-        timings.append(recall(conn, query, 5).elapsed_ms)
+        timings.append(recall(conn, query, 5, record=False).elapsed_ms)
     timings.sort()
     p95 = timings[int(len(timings) * 0.95) - 1]
     assert p95 < 100.0, f"p95 = {p95:.1f}ms"

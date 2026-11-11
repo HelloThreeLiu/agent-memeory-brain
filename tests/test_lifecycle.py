@@ -141,6 +141,33 @@ def test_capacity_pressure_archives_lowest_heat_first(
     assert set(result.to_archive_capacity) == {ids[2], ids[3], ids[4]}
 
 
+def test_capacity_only_buries_active_rows_not_dormant(
+    conn: sqlite3.Connection,
+    write: Callable[..., WriteResult],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """容量压力来自 active 数量，候选也只能是 active（审查 m-5）。
+
+    旧实现从 active+dormant 里按 heat 挑，而最冷的几乎总是 dormant：
+    结果是把还能被唤醒的条目先埋掉，active 数一点没降，下一轮继续触顶。
+    """
+    monkeypatch.setattr(policy, "MAX_ACTIVE_MEMORIES", 3)
+    monkeypatch.setattr(policy, "CAPACITY_TARGET", 2)
+    actives = [write(f"活跃条目 {index}", now=at(0)).id for index in range(5)]
+    dormants = [write(f"休眠条目 {index}", now=at(0)).id for index in range(3)]
+    for index, memory_id in enumerate(actives):
+        age(conn, memory_id, heat=0.9 - index * 0.1, last_recalled=at(200))
+    for memory_id in dormants:
+        # 比任何 active 都冷，旧逻辑下必然先被选中
+        age(conn, memory_id, heat=0.001, last_recalled=at(200))
+        conn.execute("UPDATE memories SET status = 'dormant' WHERE id = ?", (memory_id,))
+
+    result = plan(conn, now=at(200))
+    assert len(result.to_archive_capacity) == 3
+    assert set(result.to_archive_capacity) <= set(actives)
+    assert set(result.to_archive_capacity).isdisjoint(dormants)
+
+
 def test_plan_counts_purgeable_rows(
     conn: sqlite3.Connection, write: Callable[..., WriteResult], service: WriteService
 ) -> None:

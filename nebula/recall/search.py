@@ -204,13 +204,13 @@ def recall(
         for item in seated[:limit]
     )
     if record and hits:
-        # 只有"真的想起来了"的命中才记账：被扫进候选池不算（§9.5 唤醒阈值）。
-        # 置顶条目无条件下沉到记账，因为它本来就该反复出现。
-        woken = [
+        # 记账与唤醒分开：全部命中都算"被用过"（Q-8），但只有相关性到阈值的
+        # 才算"被真的想起来"、值得把 dormant 拉回 active（§9.5 唤醒阈值）。
+        woken = [hit.id for hit in hits]
+        wake = [
             hit.id for hit in hits if hit.pinned or hit.relevance >= policy.WAKE_RELEVANCE
         ]
-        if woken:
-            WriteService(conn).touch_recall(woken, now=parse_ts(stamp))
+        WriteService(conn).touch_recall(woken, wake_ids=wake, now=parse_ts(stamp))
     return RecallResult(
         query=query,
         hits=hits,

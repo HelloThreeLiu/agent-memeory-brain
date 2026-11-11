@@ -53,17 +53,27 @@ def test_recall_record_false_leaves_counters_alone(
     assert memories(conn, item.id)["recall_count"] == 0
 
 
-def test_recall_does_not_record_hits_below_wake_threshold(
+def test_recall_records_weak_hits_without_waking_them(
     conn: sqlite3.Connection,
     write: Callable[..., WriteResult],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """进了 top-k 但相关性没到唤醒阈值：不该算"被想起来"。"""
-    # 阈值设到 1 之上：覆盖率最大就是 1.0，这样"未达阈值"必然成立
+    """弱命中已注入给模型，要记账（Q-8）；但没到唤醒阈值，dormant 不该被拉起。
+
+    审查 m-4 指出的正是这个混同：把"被注入"和"被真的想起来"绑成一条阈值，
+    会让弱命中的记忆永远涨不了 recall_count，也就永远到不了 §9.2 的晋升线。
+    """
+    # 阈值设到 1 之上：覆盖率最大就是 1.0，这样"未达唤醒阈值"必然成立
     monkeypatch.setattr(policy, "WAKE_RELEVANCE", 1.01)
     item = write("记忆库用 SQLite 存储")
+    conn.execute("UPDATE memories SET status = 'dormant' WHERE id = ?", (item.id,))
+
     assert recall(conn, "记忆库 SQLite").hits
-    assert memories(conn, item.id)["recall_count"] == 0
+
+    row = memories(conn, item.id)
+    assert row["recall_count"] == 1
+    assert row["last_recalled"] is not None
+    assert row["status"] == "dormant"
 
 
 def test_recall_wakes_dormant_on_hit(
@@ -232,6 +242,7 @@ def test_explain_reports_private_partition(
 def test_explain_reports_seat_taken(
     conn: sqlite3.Connection, write: Callable[..., WriteResult]
 ) -> None:
+    """同角色写 claim 不触发仲裁，于是真要抢席位——这时 explain 必须拦。"""
     write(
         "接口方法定为 POST",
         assertion_type="decision",
@@ -242,13 +253,67 @@ def test_explain_reports_seat_taken(
     claim = write(
         "接口方法可能是 GET",
         assertion_type="claim",
-        role="agent",
+        role="user",
         fact_key="api.seat",
         now=BASE,
     )
     result = explain(conn, claim.id)
     assert result.recallable is False
     assert any("占席" in reason for reason in result.reasons)
+
+
+def test_explain_honours_double_injection_for_open_arbitration(
+    conn: sqlite3.Connection, write: Callable[..., WriteResult]
+) -> None:
+    """open 仲裁的对子召回时双注入，explain 不能判它"被占席"。
+
+    审查 M-2 的反例：同一份数据，recall 注入两条、explain 说一条不可召回。
+    """
+    write(
+        "接口方法定为 POST",
+        assertion_type="decision",
+        role="user",
+        fact_key="api.dual",
+        now=BASE,
+    )
+    challenge = write(
+        "接口方法其实是 GET",
+        assertion_type="observation",
+        role="agent",
+        fact_key="api.dual",
+        now=BASE,
+    )
+    assert challenge.arbitration_id is not None
+
+    result = explain(conn, challenge.id)
+    assert result.recallable is True
+    assert any("双注入" in reason for reason in result.reasons)
+
+    hits = recall(conn, "接口方法", 5, record=False).hits
+    assert challenge.id in {hit.id for hit in hits}, "explain 与 recall 必须同口径"
+
+
+def test_explain_does_not_block_on_same_rank(
+    conn: sqlite3.Connection, write: Callable[..., WriteResult]
+) -> None:
+    """同档席位靠综合分决定；explain 没有查询语境，不能硬判占席（M-2）。"""
+    first = write(
+        "接口可能用 GET",
+        assertion_type="claim",
+        role="agent",
+        fact_key="seat.same",
+        now=BASE,
+    )
+    write(
+        "接口可能用 PUT",
+        assertion_type="claim",
+        role="agent",
+        fact_key="seat.same",
+        now=BASE,
+    )
+    result = explain(conn, first.id)
+    assert result.recallable is True
+    assert any("同档" in reason for reason in result.reasons)
 
 
 def test_explain_unknown_id_raises(conn: sqlite3.Connection) -> None:

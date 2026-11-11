@@ -200,12 +200,18 @@ def _apply_capacity(
     if projected <= policy.MAX_ACTIVE_MEMORIES:
         return to_archive, []
 
-    already = set(to_archive)
+    already = set(to_archive) | set(to_dormant)
     candidates = sorted(
         (
             (str(row["id"]), heats[str(row["id"])])
             for row in rows
-            if int(row["pinned"]) == 0 and str(row["id"]) not in already
+            # 候选池与水位口径必须一致：水位只数 active，候选也只能从 active 里挑。
+            # 若把 dormant 也算进来，最冷的几乎总是 dormant，容量归档会先去埋
+            # 那些"还能被唤醒"的条目，而 active 数一点没降、下一轮继续触顶
+            # （P1 审查 m-5）。
+            if str(row["status"]) == "active"
+            and int(row["pinned"]) == 0
+            and str(row["id"]) not in already
         ),
         # 必须显式按 heat 排：元组默认先比 id，"mem-1" 永远排最前，
         # 归档的就成了最早写入的而不是最冷的

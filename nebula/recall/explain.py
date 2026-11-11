@@ -1,16 +1,21 @@
-"""可解释性（§9.6 / M6）：一条记忆"为什么召回到 / 为什么召不到"。
+"""可解释性（§9.6 / M6）：一条记忆"为什么召得到 / 为什么召不到"。
 
 ``expand`` 摊开来历，``explain`` 给判定。判定按 §9.4 的候选池谓词逐条过——
 凡是能让一条记忆进不了 top-k 的闸，这里都必须有一个对应的理由，否则用户看到
 的就是"我明明记得有这条，它却不见了"。
 
 顺序即优先级：先讲状态（删/归档），再讲时间窗，最后讲分区与席位。
+
+**席位闸必须与 ``recall._select_seats`` 同口径**。P1 审查 M-2 抓到过反例：
+open 仲裁的对子召回时双注入、explain 却判"被占席"，两个功能对同一事实
+给出相反答案。所以这里显式对齐三件事：双注入例外、时间基、同档不硬判。
 """
 
 from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime
 
 from nebula.core.assertion import rank as assertion_rank
 from nebula.core.timeutil import now_ts, parse_ts
@@ -82,10 +87,12 @@ def explain(
         )
 
     if not blocked:
-        seat = _seat_blocker(conn, mem)
-        if seat is not None:
+        seat = _seat_check(conn, mem, parsed_now)
+        if seat.blocker is not None:
             blocked = True
-            reasons.append(seat)
+            reasons.append(seat.blocker)
+        else:
+            reasons.extend(seat.notes)
 
     if not blocked:
         reasons.append("四道闸（状态 / 时间窗 / 分区 / 席位）都没拦，应当能被召回")
@@ -102,14 +109,35 @@ def explain(
     )
 
 
-def _seat_blocker(conn: sqlite3.Connection, mem: MemoryDetail) -> str | None:
-    """同槽位是否被更高档的当前条目占了席（§9.4 的一席制）。
+@dataclass(frozen=True)
+class _SeatCheck:
+    blocker: str | None
+    notes: tuple[str, ...] = ()
 
-    只看"当前有效"的同槽位行：已经失效的历史版本不会抢席位，把它们算进来
-    会让解释凭空多出一条"被占席"。
+
+def _seat_check(
+    conn: sqlite3.Connection, mem: MemoryDetail, now: datetime | None
+) -> _SeatCheck:
+    """一席制判定。
+
+    三处与 ``recall._select_seats`` 对齐（P1 审查 M-2）：
+
+    1. **open 仲裁对子双注入**：召回时它们享受例外，这里不能判占席；
+    2. **时间基用传入的 now**，不偷用 ``now_ts()``——否则 ``explain(now=某天)``
+       会在时间窗一处用传入值、席位一处用真实时间，自相矛盾；
+    3. **同档不判**：席位同档时比综合分（含 relevance），而 explain 没有查询
+       语境，算不出 relevance。硬用 ``seq`` 代替会给出与召回相反的结论，
+       所以只提示"取决于查询"，不拦。
     """
     if mem.fact_key is None:
-        return None
+        return _SeatCheck(None)
+
+    partner = _open_pair_partner(conn, mem.id, now)
+    if partner is not None:
+        return _SeatCheck(
+            None, (f"与 {partner} 在 open 仲裁中：一席制双注入例外，两条都会注入",)
+        )
+
     rows = conn.execute(
         """
         SELECT id, assertion_type, seq, valid_from, valid_to, status FROM memories
@@ -120,20 +148,56 @@ def _seat_blocker(conn: sqlite3.Connection, mem: MemoryDetail) -> str | None:
         (mem.fact_key, mem.scope, mem.project_id),
     ).fetchall()
     mine = assertion_rank(mem.assertion_type)
-    now = parse_ts(now_ts())
+    same_rank = False
     for row in rows:
         if str(row["id"]) == mem.id:
             continue
-        if str(row["status"]) not in ("active", "dormant"):
+        if not _covers(row, now):
             continue
-        start = parse_ts(None if row["valid_from"] is None else str(row["valid_from"]))
-        end = parse_ts(None if row["valid_to"] is None else str(row["valid_to"]))
-        if now is not None:
-            if start is not None and start > now:
-                continue
-            if end is not None and end <= now:
-                continue
         other = assertion_rank(str(row["assertion_type"]))
-        if other > mine or (other == mine and int(row["seq"]) > mem.seq):
-            return f"同槽位被 {row['id']}（{row['assertion_type']}，seq={row['seq']}）占席"
+        if other > mine:
+            return _SeatCheck(
+                f"同槽位被 {row['id']}（{row['assertion_type']}，seq={row['seq']}）"
+                "占席：档位更高"
+            )
+        if other == mine:
+            same_rank = True
+
+    notes: tuple[str, ...] = ()
+    if same_rank:
+        notes = ("同槽位有同档条目：席位按综合分决定，explain 无查询语境不判定",)
+    return _SeatCheck(None, notes)
+
+
+def _open_pair_partner(
+    conn: sqlite3.Connection, memory_id: str, now: datetime | None
+) -> str | None:
+    """本条若是某条 open 仲裁的对子（且对侧仍在当前区间），返回对侧 id。"""
+    rows = conn.execute(
+        "SELECT left_id, right_id FROM arbitration "
+        "WHERE status = 'open' AND (left_id = ? OR right_id = ?)",
+        (memory_id, memory_id),
+    ).fetchall()
+    for row in rows:
+        left = str(row["left_id"])
+        other_id = str(row["right_id"]) if left == memory_id else left
+        other = conn.execute(
+            "SELECT status, valid_from, valid_to FROM memories WHERE id = ?",
+            (other_id,),
+        ).fetchone()
+        if other is not None and _covers(other, now):
+            return other_id
     return None
+
+
+def _covers(row: sqlite3.Row, now: datetime | None) -> bool:
+    """这一行是否落在当前有效区间（与 §9.4 候选池谓词同口径）。"""
+    if str(row["status"]) not in ("active", "dormant"):
+        return False
+    if now is None:
+        return True
+    start = parse_ts(None if row["valid_from"] is None else str(row["valid_from"]))
+    end = parse_ts(None if row["valid_to"] is None else str(row["valid_to"]))
+    if start is not None and start > now:
+        return False
+    return end is None or end > now

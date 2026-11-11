@@ -162,7 +162,10 @@ class WriteService:
             yield
             self._conn.execute("COMMIT")
         except Exception:
-            self._conn.execute("ROLLBACK")
+            # 有些错误（SQLITE_FULL / IOERR 一类）会触发 SQLite 自动回滚，
+            # 此时再 ROLLBACK 会抛 "no transaction is active"，把原始异常顶掉
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
             raise
 
     def _begin(self) -> None:
@@ -268,23 +271,31 @@ class WriteService:
         self,
         memory_ids: Sequence[str],
         *,
+        wake_ids: Sequence[str] | None = None,
         now: datetime | None = None,
         host: str | None = None,
         session_id: str | None = None,
     ) -> int:
-        """召回记账：``last_recalled`` / ``recall_count``，并唤醒 dormant。
+        """召回记账 + 唤醒，两件事分开。
 
-        §9.2 的晋升触发（``recall_count ≥ 3``）与 §9.5 的衰减/auto-archive 全依赖
-        这两个字段（BACKLOG Q-8）。调用方只应传**相关性已达唤醒阈值**的命中——
-        ``dormant → active`` 的判据是"被真的想起来了"，不是"被扫进候选池"。
+        ``memory_ids``：被注入给模型的全部命中 → 写 ``last_recalled`` / ``recall_count``。
+        ``wake_ids``：其中**相关性达唤醒阈值**的部分 → ``dormant`` 回到 ``active``。
+        默认两者相同（不传 wake_ids 时全部唤醒）。
+
+        分开的理由（P1 审查 m-4）：Q-8 的口径是"命中即记账"，而唤醒是 §9.5 的
+        另一条判据（"被真的想起来"）。弱命中已经注入给模型、参与了本轮回答，
+        不计入 §9.2 的晋升触发，会让"用过的记忆永远升不上去"。
 
         读路径要写库也必须走本模块，不允许 recall 自己 UPDATE（INV1）。
         """
         ids = tuple(dict.fromkeys(memory_ids))
         if not ids:
             return 0
+        wake = tuple(dict.fromkeys(wake_ids)) if wake_ids is not None else ids
+        wake_set = set(wake) & set(ids)
         stamp = fmt(now) if now is not None else now_ts()
         encoded = json.dumps(list(ids), ensure_ascii=False)
+        encoded_wake = json.dumps(sorted(wake_set), ensure_ascii=False)
         touched = 0
         with self.transaction():
             rows = self._conn.execute(
@@ -300,11 +311,14 @@ class WriteService:
                     """
                     UPDATE memories
                     SET last_recalled = ?, recall_count = recall_count + 1,
-                        status = CASE WHEN status = 'dormant' THEN 'active' ELSE status END
+                        status = CASE
+                            WHEN status = 'dormant'
+                             AND id IN (SELECT value FROM json_each(?))
+                            THEN 'active' ELSE status END
                     WHERE id IN (SELECT value FROM json_each(?))
                       AND status IN ('active', 'dormant')
                     """,
-                    (stamp, encoded),
+                    (stamp, encoded_wake, encoded),
                 )
                 for row in rows:
                     self._log_event(
@@ -483,45 +497,49 @@ class WriteService:
         """
         stamp = fmt(now) if now is not None else now_ts()
         cutoff = _days_before(stamp, RECYCLE_WINDOW_DAYS)
-        rows = self._conn.execute(
-            "SELECT id, seq, scope, visibility FROM memories "
-            "WHERE status = 'deleted' AND deleted_at IS NOT NULL AND deleted_at <= ?",
-            (cutoff,),
-        ).fetchall()
-        if not rows:
-            return 0
-        ids = [str(row["id"]) for row in rows]
-        encoded = json.dumps(ids, ensure_ascii=False)
-        event_seq = self._current_seq()
+        purged = 0
+        # 预读必须在拿写锁之后：事务外读到的候选，可能在拿锁前被另一个进程
+        # restore 掉，随后按旧 id 硬删就把刚复原的记忆删了（P1 审查 m-3）。
         with self.transaction():
-            self._conn.execute(
-                "DELETE FROM memory_links WHERE src IN (SELECT value FROM json_each(?)) "
-                "OR dst IN (SELECT value FROM json_each(?))",
-                (encoded, encoded),
-            )
-            self._conn.execute(
-                "DELETE FROM arbitration WHERE left_id IN (SELECT value FROM json_each(?)) "
-                "OR right_id IN (SELECT value FROM json_each(?))",
-                (encoded, encoded),
-            )
-            self._conn.execute(
-                "DELETE FROM memories_fts WHERE memory_id IN (SELECT value FROM json_each(?))",
-                (encoded,),
-            )
-            self._conn.execute(
-                "DELETE FROM memories WHERE id IN (SELECT value FROM json_each(?)) ",
-                (encoded,),
-            )
-            self._log_event(
-                event_seq,
-                stamp,
-                host,
-                session_id,
-                "memory.purged",
-                None,
-                {"count": len(ids)},
-            )
-        return len(ids)
+            rows = self._conn.execute(
+                "SELECT id FROM memories "
+                "WHERE status = 'deleted' AND deleted_at IS NOT NULL AND deleted_at <= ?",
+                (cutoff,),
+            ).fetchall()
+            if rows:
+                ids = [str(row["id"]) for row in rows]
+                encoded = json.dumps(ids, ensure_ascii=False)
+                self._conn.execute(
+                    "DELETE FROM memory_links WHERE src IN (SELECT value FROM json_each(?)) "
+                    "OR dst IN (SELECT value FROM json_each(?))",
+                    (encoded, encoded),
+                )
+                self._conn.execute(
+                    "DELETE FROM arbitration WHERE left_id IN (SELECT value FROM json_each(?)) "
+                    "OR right_id IN (SELECT value FROM json_each(?))",
+                    (encoded, encoded),
+                )
+                self._conn.execute(
+                    "DELETE FROM memories_fts "
+                    "WHERE memory_id IN (SELECT value FROM json_each(?))",
+                    (encoded,),
+                )
+                self._conn.execute(
+                    "DELETE FROM memories WHERE id IN (SELECT value FROM json_each(?)) "
+                    "AND status = 'deleted' AND deleted_at IS NOT NULL AND deleted_at <= ?",
+                    (encoded, cutoff),
+                )
+                self._log_event(
+                    self._current_seq(),
+                    stamp,
+                    host,
+                    session_id,
+                    "memory.purged",
+                    None,
+                    {"count": len(ids)},
+                )
+                purged = len(ids)
+        return purged
 
     def resolve_arbitration(
         self,
@@ -1286,9 +1304,8 @@ class WriteService:
             )
             return
 
-        start = winner["valid_from"]
-        boundary = stamp if start is None else str(start)
         refuted = str(loser["assertion_type"]) == "claim"
+        boundary = _retire_boundary(winner["valid_from"], loser["valid_from"], stamp)
         self._conn.execute(
             """
             UPDATE memories
@@ -1357,6 +1374,31 @@ class WriteService:
                 visibility,
             ),
         )
+
+
+def _retire_boundary(winner_from: object, loser_from: object, stamp: str) -> str:
+    """裁决终态的左边界（§9.3「终态的区间几何」）。
+
+    唯一硬约束：``valid_to >= 输家 valid_from``。写成倒挂区间等于宣布这条历史
+    从未成立，而 ``expired_at`` 的不可变触发器让它再也改不回来（P1 审查 M-1）。
+
+    - 赢家更晚生效（新压旧）→ 在赢家生效处让位
+    - 赢家更早生效（旧条胜出）→ 撑到被裁决为止：输家从自己生效到裁决之间
+      **确实被注入过**，"它错了"由 superseded_by / refuted 承载，不由负区间承载
+    - 时间缺失或异常 → 裁决时刻，再兜一层不早于输家自己的生效时刻
+    """
+    started = parse_ts(None if loser_from is None else str(loser_from))
+    upstream = parse_ts(None if winner_from is None else str(winner_from))
+    decided = parse_ts(stamp)
+    boundary: datetime | None
+
+    if upstream is not None and started is not None and upstream >= started:
+        boundary = upstream
+    else:
+        boundary = decided if decided is not None else started
+    if started is not None and (boundary is None or boundary < started):
+        boundary = started
+    return stamp if boundary is None else fmt(boundary)
 
 
 def _days_before(stamp: str, days: int) -> str:

@@ -1526,11 +1526,22 @@ class WriteService:
         *,
         scope: str | None = None,
         visibility: str | None = None,
+        project_id: str | None = None,
     ) -> None:
+        # project_id 是 target 的派生数据。让十几个调用点各抄一遍，抄错了不会报错，
+        # 只会让某个分区的事件在过滤后静默消失——一次主键查询换掉这个重复。
+        if project_id is None and target is not None:
+            derived = self._conn.execute(
+                "SELECT project_id FROM memories WHERE id = ?", (target,)
+            ).fetchone()
+            if derived is not None and derived["project_id"] is not None:
+                project_id = str(derived["project_id"])
         self._conn.execute(
             """
-            INSERT INTO events (seq, ts, host, session, type, target, payload, scope, visibility)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO events (
+                seq, ts, host, session, type, target, payload, scope, visibility, project_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 seq,
@@ -1542,6 +1553,7 @@ class WriteService:
                 None if payload is None else json.dumps(payload, ensure_ascii=False),
                 scope,
                 visibility,
+                project_id,
             ),
         )
 

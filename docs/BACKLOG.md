@@ -23,7 +23,7 @@
 - 并发：两进程各写 100 条 → 200 个唯一 id，`seq` = 1..200 无洞（连跑 5 次稳定）。
 - 唯一未命中的查询是「用什么数据库存储数据」——问句太泛，"数据/存储"命中了一堆邻近主题。合成种子的局限，等 P1.5 真实日志再校准。
 
-## 当前批次：P1 生命周期（目标：会忘、能复原、能追责）—— 已收口
+## 上批：P1 生命周期（目标：会忘、能复原、能追责）—— 已收口
 
 | ID | 类型 | 级别 | 事项 | 验收标准 | 状态 |
 |---|---|---|---|---|---|
@@ -44,6 +44,22 @@
 - 回收站往返：29 天可复原、31 天拒绝；`purge_expired` 只删超期行，且先清 links / arbitration 再删主体。
 - 仲裁终态：left/right 输家退出当前区间但行保留、claim 输家转 `archived(refuted)`、`both` 两条都不动、重复裁决被拒、输家已失效时不撞 INV3 触发器。
 - 并发用例的成功率：单跑 6/6、全量 16/16 绿；此前在 build 同时进行时失败过 1 次（约 1/20 量级），是 Q-9 那条 Windows 多进程瞬态问题。审查修复批次补了 `BEGIN` 有界重试，但没有清零，故 Q-9 记为"部分收口"而非"已收口"。
+
+## 当前批次：P1.5a 接入面（目标：宿主能调、日志能攒、私有分区不漏）
+
+> 切分理由：a 段全部可在本机自动化验证；b 段（选宿主、配 MCP、连续用 5 天）需要外部时间。
+> 设计口径见 §10.6（读路径可见性）与 §10.5（B 档注入落法）。
+
+| ID | 类型 | 级别 | 事项 | 验收标准 | 状态 |
+|---|---|---|---|---|---|
+| A-1 | feat(schema) | L | schema v4：`injection_log` / `feedback` 两表 | v3→v4 升级用例绿；§8.1.1 文档 DDL 同步门禁绿；旧库升级后原有行不受影响 | todo |
+| A-2 | feat(store) | L | 写口 `log_injection` / `record_feedback` | 每次都落一行且同事务落 `events`；`feedback` 对不存在的 id 报错而非静默；断言会红 | todo |
+| A-3 | feat(recall) | L | 读路径可见性口径（§10.6，收口 R-8） | `expand`/`explain` 对 private 无 session 调用方返回"不可见"且**输出不含原文**；`events` 按 scope/visibility 过滤；CLI `--show-all` 可看全部 | todo |
+| A-4 | feat(adapter) | M | `project_id` 解析（§10.4）+ B 档指针块生成器（§10.5） | git remote / git toplevel / 非 git 路径三种解析用例；指针块重复 install 幂等、uninstall 无残留 | todo |
+| A-5 | feat(mcp) | L | 零依赖 MCP stdio server + `remember`/`recall`/`expand`/`feedback` 四工具 | `initialize → tools/list → tools/call` 全流程可跑；`recall` 每次落 `injection_log`；断网与零 LLM 均可用；不新增运行时依赖 | todo |
+| A-6 | test(mcp) | L | 接入面专项门禁 | subprocess 逐行 JSON-RPC 端到端用例；四工具各 ≥1 契约用例 + 错误路径；全门禁绿 + wheel 可出 | todo |
+
+**范围外（记在 b 段）**：宿主选择与配置、指针块写入真实仓库、5 天真实使用、三项指标报告（`nebula report`）、阈值校准结论。
 
 ## 原 P1 口子（Q-1..Q-9）的收口
 

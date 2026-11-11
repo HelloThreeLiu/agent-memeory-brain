@@ -255,6 +255,24 @@ _V3_LIFECYCLE: tuple[str, ...] = (
 #: v4：接入面。两张表是 P1.5 三项指标的唯一数据源（§8.1 / §16.2）：
 #: 没有 `injection_log`，"负反馈率"没有分母；没有 `feedback`，"信任衰减"无从观测。
 _V4_INTERFACE: tuple[str, ...] = (
+    # 事件表缺 project_id：v3 补了 scope/visibility，但 `scope='project'` 的事件
+    # 只能看出"属于某个项目"，看不出是哪个 → 读路径没法过滤，只能一律不显示。
+    # 补列后 §10.6 的连带数据过滤才成立（P1.5a，R-8）。
+    "DROP TRIGGER IF EXISTS trg_events_no_update",
+    "ALTER TABLE events ADD COLUMN project_id TEXT",
+    """
+    UPDATE events SET project_id = (
+        SELECT project_id FROM memories WHERE memories.id = events.target
+    ) WHERE EXISTS (SELECT 1 FROM memories WHERE memories.id = events.target)
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_events_no_update
+    BEFORE UPDATE ON events
+    FOR EACH ROW
+    BEGIN
+        SELECT RAISE(ABORT, 'events 是 append-only，不允许 UPDATE');
+    END
+    """,
     """
     CREATE TABLE IF NOT EXISTS injection_log (
         id             TEXT PRIMARY KEY,

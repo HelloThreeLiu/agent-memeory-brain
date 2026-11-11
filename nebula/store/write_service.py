@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -53,6 +54,22 @@ _STATUS_TRANSITIONS: dict[str, tuple[str, ...]] = {
     "archived": ("active", "dormant"),
     "deleted": ("active", "dormant", "archived"),
 }
+
+#: ``BEGIN IMMEDIATE`` 的有界重试（BACKLOG Q-9）。只重试"事务还没开始"这一步：
+#: 语句已经跑过再重试，等于把可能已部分生效的写入重放一遍，那是改语义，不是容错。
+_BEGIN_ATTEMPTS = 5
+_BEGIN_BACKOFF_SECONDS = 0.05
+_TRANSIENT_MARKERS = (
+    "database is locked",
+    "database table is locked",
+    "attempt to write a readonly database",
+    "disk i/o error",
+)
+
+
+def _is_transient(exc: sqlite3.OperationalError) -> bool:
+    text = str(exc).lower()
+    return any(marker in text for marker in _TRANSIENT_MARKERS)
 
 
 class InvariantViolation(RuntimeError):
@@ -132,17 +149,31 @@ class WriteService:
         睡眠周期要把"衰减 + 休眠 + 归档 + 清回收站"一次提交：只落一半比完全
         没跑更难排查。SQLite 不支持嵌套 ``BEGIN``，所以这里用 ``in_transaction``
         判断是否需要自己开。
+
+        ``BEGIN IMMEDIATE`` 拿锁失败时有界重试：Windows 上两个进程直连同一个库
+        会偶发 ``locked`` / ``readonly``（Q-9）。重试范围只有"开事务"这一步，
+        事务已经跑起来的错误照常冒出去——那种情况重试会把半截写入重放。
         """
         if self._conn.in_transaction:
             yield
             return
-        self._conn.execute("BEGIN IMMEDIATE")
+        self._begin()
         try:
             yield
             self._conn.execute("COMMIT")
         except Exception:
             self._conn.execute("ROLLBACK")
             raise
+
+    def _begin(self) -> None:
+        for attempt in range(_BEGIN_ATTEMPTS):
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                return
+            except sqlite3.OperationalError as exc:
+                if not _is_transient(exc) or attempt == _BEGIN_ATTEMPTS - 1:
+                    raise
+                time.sleep(_BEGIN_BACKOFF_SECONDS * (attempt + 1))
 
     # ------------------------------------------------------------------ 写入
 

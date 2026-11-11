@@ -23,6 +23,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+from uuid import uuid4
 
 from nebula.core import conflict
 from nebula.core.assertion import role_from_asserted_by
@@ -43,6 +44,10 @@ RECYCLE_WINDOW_DAYS = 30
 
 #: 归档原因白名单（与 schema 的 CHECK 一致）
 ARCHIVE_REASONS: tuple[str, ...] = ("decay", "capacity", "refuted")
+
+#: 反馈类型白名单（与 schema 的 CHECK 一致）。指标只认这三类：
+#: ``useful`` 是正信号，``useless``/``wrong`` 进负反馈率分子（§16.2）。
+FEEDBACK_KINDS: tuple[str, ...] = ("useful", "useless", "wrong")
 
 #: 裁决结论。``merged`` 在 §8.1 的枚举里，但 §9.3 没定义合并后的正文归属，
 #: P1 不开放——宁可显式拒绝，也不猜一个"合并"出来（见 resolve_arbitration）。
@@ -94,6 +99,23 @@ class WriteResult:
     superseded: tuple[str, ...] = ()
     arbitration_id: str | None = None
     note: str = ""
+
+
+def _new_id(prefix: str) -> str:
+    """接入面两张表的 id（P1.5a）。
+
+    不消耗 ``counter`` 的 seq：seq 是**记忆写入顺序**（INV2），注入与反馈拿去用会在
+    seq 上留洞，直接违背 P0 验收的「seq 连续无洞」。这两张表的 id 只需要唯一，
+    不需要参与排序。
+    """
+    return f"{prefix}-{uuid4().hex[:12]}"
+
+
+@dataclass(frozen=True)
+class FeedbackResult:
+    id: str
+    memory_id: str
+    kind: str
 
 
 @dataclass(frozen=True)
@@ -334,6 +356,138 @@ class WriteService:
                     )
             touched = len(rows)
         return touched
+
+    # -------------------------------------------------------------- 接入面记账
+
+    def log_injection(
+        self,
+        *,
+        query: str,
+        memory_ids: Sequence[str],
+        chars: int,
+        top_k: int,
+        host: str | None = None,
+        session_id: str | None = None,
+        project_id: str | None = None,
+        degraded_level: int = 0,
+        elapsed_ms: float | None = None,
+        now: datetime | None = None,
+    ) -> str:
+        """记一次注入，返回 ``inj-xxx``。
+
+        **不落 events**：注入是读行为，每轮都落审计会把 events 变成第二份流水
+        （300 轮 = 300 条审计），而审计要回答的是"谁改了什么"，不是"谁看了什么"。
+        指标需要的东西全在 ``injection_log`` 里。
+
+        ``chars`` 由调用方按实际注入文本量给（§16.2 的 token 预算观测），写层不
+        自己数——注入格式属于 recall / adapter 层，写层不该知道渲染细节。
+        """
+        if top_k <= 0:
+            raise ValueError("top_k 必须为正")
+        if chars < 0:
+            raise ValueError("chars 不能为负")
+        if degraded_level < 0:
+            raise ValueError("degraded_level 不能为负")
+        ids = tuple(dict.fromkeys(memory_ids))
+        stamp = fmt(now) if now is not None else now_ts()
+        injection_id = _new_id("inj")
+        with self.transaction():
+            self._conn.execute(
+                """
+                INSERT INTO injection_log (
+                    id, ts, host, session, project_id, query, memory_ids,
+                    chars, top_k, degraded_level, elapsed_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    injection_id,
+                    stamp,
+                    host,
+                    session_id,
+                    project_id,
+                    query,
+                    json.dumps(list(ids), ensure_ascii=False),
+                    chars,
+                    top_k,
+                    degraded_level,
+                    elapsed_ms,
+                ),
+            )
+        return injection_id
+
+    def record_feedback(
+        self,
+        memory_id: str,
+        kind: str,
+        *,
+        source: str = "tool",
+        note: str | None = None,
+        injection_id: str | None = None,
+        host: str | None = None,
+        session_id: str | None = None,
+        now: datetime | None = None,
+    ) -> FeedbackResult:
+        """记一条反馈（§16.2 的唯一数据源），同时落一条审计事件。
+
+        **对不存在的 id 抛错，不静默接受**：模型代调工具时最容易把 id 记错一个字符，
+        静默吞掉会让"负反馈率"看起来永远是 0——那比没有指标更糟。
+
+        **本批不改 confidence**：设计文档 §9.5 只定义了"删 L3 → 依赖它的 L4 降权"，
+        没有定义"负反馈降权"。降多少要等 b 段攒出的基线，现在拍一个数字就是猜。
+
+        ``note`` 只进 ``feedback`` 表，不进 ``events.payload``：payload 会被 expand
+        摊给别的分区看，正文摘要与用户吐槽都可能带私密内容（P0 审查 m-11 同款）。
+        """
+        if kind not in FEEDBACK_KINDS:
+            raise ValueError(f"未知的反馈类型：{kind!r}，可选 {FEEDBACK_KINDS}")
+        text = (note or "").strip() or None
+        stamp = fmt(now) if now is not None else now_ts()
+        feedback_id = _new_id("fb")
+
+        with self.transaction():
+            row = self._conn.execute(
+                "SELECT id, seq, scope, visibility FROM memories WHERE id = ?",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"没有这条记忆：{memory_id}（反馈必须指向真实存在的条目）")
+            if injection_id is not None:
+                exists = self._conn.execute(
+                    "SELECT 1 FROM injection_log WHERE id = ?", (injection_id,)
+                ).fetchone()
+                if exists is None:
+                    raise ValueError(f"没有这次注入记录：{injection_id}")
+
+            self._conn.execute(
+                """
+                INSERT INTO feedback (
+                    id, ts, memory_id, kind, source, host, session, note, injection_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    feedback_id,
+                    stamp,
+                    memory_id,
+                    kind,
+                    source,
+                    host,
+                    session_id,
+                    text,
+                    injection_id,
+                ),
+            )
+            self._log_event(
+                int(row["seq"]),
+                stamp,
+                host,
+                session_id,
+                "feedback.recorded",
+                memory_id,
+                {"kind": kind, "source": source},
+                scope=str(row["scope"]),
+                visibility=str(row["visibility"]),
+            )
+        return FeedbackResult(id=feedback_id, memory_id=memory_id, kind=kind)
 
     def pin(
         self,

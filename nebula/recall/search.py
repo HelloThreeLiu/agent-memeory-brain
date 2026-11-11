@@ -19,8 +19,10 @@ from dataclasses import dataclass, field
 from nebula.core import scoring
 from nebula.core.assertion import rank as assertion_rank
 from nebula.core.assertion import role_from_asserted_by
-from nebula.core.timeutil import now_ts
+from nebula.core.timeutil import now_ts, parse_ts
 from nebula.core.tokenize import query_tokens
+from nebula.lifecycle import policy
+from nebula.store.write_service import WriteService
 
 #: FTS 先粗捞再精排：候选上限与 limit 的关系
 CANDIDATE_FACTOR = 20
@@ -40,6 +42,8 @@ class Hit:
     score: float
     seq: int
     pinned: bool
+    weight: float = 1.0
+    confidence: float = 0.6
     pointer_count: int = 0
 
     def format_line(self) -> str:
@@ -87,11 +91,16 @@ def recall(
     project_id: str | None = None,
     viewer_session: str | None = None,
     now: str | None = None,
+    record: bool = True,
 ) -> RecallResult:
     """按查询取 top-k。
 
     ``viewer_session`` 决定 ``visibility=private`` 的条目能不能进候选集（INV7）：
     私有片段只对同一 session 可见，不是取回来再过滤。
+
+    ``record=True`` 时把命中的 ``last_recalled`` / ``recall_count`` 写回库
+    （BACKLOG Q-8）——9.2 的晋升触发与 9.5 的衰减都靠它。写仍然经
+    ``write_service``，读路径不自己 UPDATE（INV1）。只读场景传 ``False``。
     """
     started = time.perf_counter()
     tokens = query_tokens(query)
@@ -139,6 +148,8 @@ def recall(
         if relevance < scoring.MIN_RELEVANCE and not pinned:
             continue
         importance = float(row["importance"])
+        weight = float(row["weight"])
+        confidence = float(row["confidence"])
         layer = str(row["layer"])
         hit = Hit(
             id=memory_id,
@@ -150,10 +161,17 @@ def recall(
             importance=importance,
             relevance=relevance,
             score=scoring.score(
-                relevance=relevance, importance=importance, layer=layer, pinned=pinned
+                relevance=relevance,
+                importance=importance,
+                layer=layer,
+                pinned=pinned,
+                weight=weight,
+                confidence=confidence,
             ),
             seq=int(row["seq"]),
             pinned=pinned,
+            weight=weight,
+            confidence=confidence,
         )
         candidates.append(
             _Candidate(
@@ -179,10 +197,20 @@ def recall(
             score=item.hit.score,
             seq=item.hit.seq,
             pinned=item.hit.pinned,
+            weight=item.hit.weight,
+            confidence=item.hit.confidence,
             pointer_count=pointers.get(item.hit.id, 0),
         )
         for item in seated[:limit]
     )
+    if record and hits:
+        # 只有"真的想起来了"的命中才记账：被扫进候选池不算（§9.5 唤醒阈值）。
+        # 置顶条目无条件下沉到记账，因为它本来就该反复出现。
+        woken = [
+            hit.id for hit in hits if hit.pinned or hit.relevance >= policy.WAKE_RELEVANCE
+        ]
+        if woken:
+            WriteService(conn).touch_recall(woken, now=parse_ts(stamp))
     return RecallResult(
         query=query,
         hits=hits,
@@ -236,7 +264,8 @@ def _fetch_pool(
         params.append(project_id)
     sql = (
         "SELECT id, content, assertion_type, asserted_by, fact_key, layer, importance, "
-        "pinned, seq, scope, project_id FROM memories WHERE " + " AND ".join(conditions)
+        "weight, confidence, pinned, seq, scope, project_id FROM memories WHERE "
+        + " AND ".join(conditions)
     )
     rows: list[sqlite3.Row] = conn.execute(sql, params).fetchall()
     return rows

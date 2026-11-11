@@ -1,0 +1,139 @@
+"""可解释性（§9.6 / M6）：一条记忆"为什么召回到 / 为什么召不到"。
+
+``expand`` 摊开来历，``explain`` 给判定。判定按 §9.4 的候选池谓词逐条过——
+凡是能让一条记忆进不了 top-k 的闸，这里都必须有一个对应的理由，否则用户看到
+的就是"我明明记得有这条，它却不见了"。
+
+顺序即优先级：先讲状态（删/归档），再讲时间窗，最后讲分区与席位。
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from dataclasses import dataclass
+
+from nebula.core.assertion import rank as assertion_rank
+from nebula.core.timeutil import now_ts, parse_ts
+from nebula.recall.detail import ExpandResult, MemoryDetail, expand
+
+
+@dataclass(frozen=True)
+class Explanation:
+    memory_id: str
+    recallable: bool
+    reasons: tuple[str, ...]
+    detail: ExpandResult
+
+    def lines(self) -> tuple[str, ...]:
+        head = "可召回" if self.recallable else "不可召回"
+        out = [f"{head}：{self.memory_id}"]
+        out.extend(f"  - {reason}" for reason in self.reasons)
+        out.append("")
+        out.extend(self.detail.lines())
+        return tuple(out)
+
+
+def explain(
+    conn: sqlite3.Connection,
+    memory_id: str,
+    *,
+    viewer_session: str | None = None,
+    now: str | None = None,
+) -> Explanation:
+    """按候选池谓词逐条检查，返回第一处拦截原因与完整来历。
+
+    ``viewer_session`` 与 ``recall`` 同义：不传就当作"没有私有分区身份"，
+    private 条目会被判为不可见（这才是真实调用方的默认处境）。
+    """
+    detail = expand(conn, memory_id)
+    mem = detail.memory
+    stamp = now or now_ts()
+    parsed_now = parse_ts(stamp)
+
+    reasons: list[str] = []
+    blocked = False
+
+    if mem.status == "deleted":
+        blocked = True
+        reasons.append(
+            f"在回收站（{mem.deleted_at or '时间未知'} 起）：30 天内可 restore，之后才物理删"
+        )
+    elif mem.status == "archived":
+        blocked = True
+        suffix = f"，原因 {mem.archived_reason}" if mem.archived_reason else ""
+        reasons.append(f"已归档（{mem.archived_at or '时间未知'}{suffix}）：不进候选池")
+
+    start = parse_ts(mem.valid_from)
+    end = parse_ts(mem.valid_to)
+    if parsed_now is not None:
+        if start is not None and start > parsed_now:
+            blocked = True
+            reasons.append(f"尚未生效：valid_from = {mem.valid_from}")
+        if end is not None and end <= parsed_now:
+            blocked = True
+            successor = f"，被 {mem.superseded_by} 取代" if mem.superseded_by else ""
+            reasons.append(f"已失效：valid_to = {mem.valid_to}{successor}")
+
+    if mem.visibility == "private" and (viewer_session is None or mem.session_id != viewer_session):
+        blocked = True
+        reasons.append(
+            f"私有分区：只对 session={mem.session_id} 可见，当前调用方"
+            + (f"是 {viewer_session}" if viewer_session else "没有 session 身份")
+        )
+
+    if not blocked:
+        seat = _seat_blocker(conn, mem)
+        if seat is not None:
+            blocked = True
+            reasons.append(seat)
+
+    if not blocked:
+        reasons.append("四道闸（状态 / 时间窗 / 分区 / 席位）都没拦，应当能被召回")
+        reasons.append(
+            f"命中与否取决于查询相关性：当前 importance {mem.importance:.2f}、"
+            f"weight {mem.weight:.2f}、heat {mem.heat:.3f}"
+        )
+
+    return Explanation(
+        memory_id=memory_id,
+        recallable=not blocked,
+        reasons=tuple(reasons),
+        detail=detail,
+    )
+
+
+def _seat_blocker(conn: sqlite3.Connection, mem: MemoryDetail) -> str | None:
+    """同槽位是否被更高档的当前条目占了席（§9.4 的一席制）。
+
+    只看"当前有效"的同槽位行：已经失效的历史版本不会抢席位，把它们算进来
+    会让解释凭空多出一条"被占席"。
+    """
+    if mem.fact_key is None:
+        return None
+    rows = conn.execute(
+        """
+        SELECT id, assertion_type, seq, valid_from, valid_to, status FROM memories
+        WHERE fact_key = ? AND scope = ?
+          AND COALESCE(project_id, '') = COALESCE(?, '')
+        ORDER BY seq
+        """,
+        (mem.fact_key, mem.scope, mem.project_id),
+    ).fetchall()
+    mine = assertion_rank(mem.assertion_type)
+    now = parse_ts(now_ts())
+    for row in rows:
+        if str(row["id"]) == mem.id:
+            continue
+        if str(row["status"]) not in ("active", "dormant"):
+            continue
+        start = parse_ts(None if row["valid_from"] is None else str(row["valid_from"]))
+        end = parse_ts(None if row["valid_to"] is None else str(row["valid_to"]))
+        if now is not None:
+            if start is not None and start > now:
+                continue
+            if end is not None and end <= now:
+                continue
+        other = assertion_rank(str(row["assertion_type"]))
+        if other > mine or (other == mine and int(row["seq"]) > mem.seq):
+            return f"同槽位被 {row['id']}（{row['assertion_type']}，seq={row['seq']}）占席"
+    return None

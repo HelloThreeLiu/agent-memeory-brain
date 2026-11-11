@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nebula-memory"
-version = "0.0.2"
+version = "0.0.3"
 description = "本地优先的四层记忆引擎：可追溯、可回滚、零模型也能跑"
 readme = "README.md"
 requires-python = ">=3.11"

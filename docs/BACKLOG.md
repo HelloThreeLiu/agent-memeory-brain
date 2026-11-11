@@ -52,14 +52,27 @@
 
 | ID | 类型 | 级别 | 事项 | 验收标准 | 状态 |
 |---|---|---|---|---|---|
-| A-1 | feat(schema) | L | schema v4：`injection_log` / `feedback` 两表 | v3→v4 升级用例绿；§8.1.1 文档 DDL 同步门禁绿；旧库升级后原有行不受影响 | todo |
-| A-2 | feat(store) | L | 写口 `log_injection` / `record_feedback` | 每次都落一行且同事务落 `events`；`feedback` 对不存在的 id 报错而非静默；断言会红 | todo |
-| A-3 | feat(recall) | L | 读路径可见性口径（§10.6，收口 R-8） | `expand`/`explain` 对 private 无 session 调用方返回"不可见"且**输出不含原文**；`events` 按 scope/visibility 过滤；CLI `--show-all` 可看全部 | todo |
-| A-4 | feat(adapter) | M | `project_id` 解析（§10.4）+ B 档指针块生成器（§10.5） | git remote / git toplevel / 非 git 路径三种解析用例；指针块重复 install 幂等、uninstall 无残留 | todo |
-| A-5 | feat(mcp) | L | 零依赖 MCP stdio server + `remember`/`recall`/`expand`/`feedback` 四工具 | `initialize → tools/list → tools/call` 全流程可跑；`recall` 每次落 `injection_log`；断网与零 LLM 均可用；不新增运行时依赖 | todo |
-| A-6 | test(mcp) | L | 接入面专项门禁 | subprocess 逐行 JSON-RPC 端到端用例；四工具各 ≥1 契约用例 + 错误路径；全门禁绿 + wheel 可出 | todo |
+| A-1 | feat(schema) | L | schema v4：`injection_log` / `feedback` 两表 | v3→v4 升级用例绿；§8.1.1 文档 DDL 同步门禁绿；旧库升级后原有行不受影响 | done |
+| A-2 | feat(store) | L | 写口 `log_injection` / `record_feedback` | 每次都落一行且同事务落 `events`；`feedback` 对不存在的 id 报错而非静默；断言会红 | done |
+| A-3 | feat(recall) | L | 读路径可见性口径（§10.6，收口 R-8） | `expand`/`explain` 对 private 无 session 调用方返回"不可见"且**输出不含原文**；`events` 按 scope/visibility 过滤；CLI `--show-all` 可看全部 | done |
+| A-4 | feat(adapter) | M | `project_id` 解析（§10.4）+ B 档指针块生成器（§10.5） | git remote / git toplevel / 非 git 路径三种解析用例；指针块重复 install 幂等、uninstall 无残留 | done |
+| A-5 | feat(mcp) | L | 零依赖 MCP stdio server + `remember`/`recall`/`expand`/`feedback` 四工具 | `initialize → tools/list → tools/call` 全流程可跑；`recall` 每次落 `injection_log`；断网与零 LLM 均可用；不新增运行时依赖 | done |
+| A-6 | test(mcp) | L | 接入面专项门禁 | subprocess 逐行 JSON-RPC 端到端用例；四工具各 ≥1 契约用例 + 错误路径；全门禁绿 + wheel 可出 | done |
 
-**范围外（记在 b 段）**：宿主选择与配置、指针块写入真实仓库、5 天真实使用、三项指标报告（`nebula report`）、阈值校准结论。
+**实测结果（2026-11-11，本机 Python 3.13.12 / SQLite 3.53.1）**
+
+- 门禁：`ruff` 0 问题 / `mypy --strict` 0 问题（29 文件）/ `pytest` **227 passed** / `python -m build` 出 `nebula_memory-0.0.3` wheel（零运行时依赖，`pip-audit` 按 CI 口径跳过；wheel 内含新增的 `nebula/mcp/` 与 `nebula/adapter/`，已解包核对）。
+- **协议**：真起子进程喂 stdio 跑通 `initialize → notifications/initialized → tools/list → remember → recall → feedback`；故意发一行坏 JSON 后进程不退出，下一条 `ping` 正常响应。`protocolVersion` 原样回显客户端值。
+- **注入日志**：命中与未命中的召回各落一行（`memory_ids` 分别是 `[]` 与 `["mem-1"]`），`host`/`project_id` 落全，`chars` 为实际注入文本长度。
+- **可见性**：private 条目对别的 session 的 `expand` 返回"不可见"，输出与异常文本**都不含原文**（断言同时查 `9222` 与整句）；历史版本按同口径过滤并给出"N 个版本不可见"；无分区信息的历史事件不返回。反例验证：去掉 private 判定后 11 条用例里 6 条变红。
+- **反馈回连**：用 `json_each` 而非 `LIKE` 找最近注入——专测 `mem-1` / `mem-10` 前缀歧义，反馈不会挂错注入。
+- **project 解析**：remote / toplevel / loose / manifest 四种来源各有用例；同一 remote 的两个本地路径得到同一个 id（这正是它存在的理由）。
+- **指针块**：install 幂等（第二次 `unchanged`）、uninstall 后原文逐字节恢复、CRLF 文件保持 CRLF、标记不成对时抛错且一个字节不改。手动往返冒烟已跑。
+- **loose 目录**：非 git 目录不让路径 hash 冒充项目边界——读过滤不用它、`remember` 默认退回 `global`、显式要 `scope=project` 时要求给真 id。
+
+**未覆盖、留给 b 段**：真宿主上的工具调用成功率（模型会不会主动调 `recall`）、5 天 ≥300 条注入记录、三项指标报告、阈值是否要调。这些都需要真实对话量，本机自动化测不出来。
+
+**b 段范围外清单**（明确不在本批做）：选宿主与写配置、指针块写进真实仓库、连续 5 天使用、`nebula report` 三项指标、阈值校准结论、负反馈是否降 `confidence`（要基线才能定降多少，现在拍数字就是猜）。
 
 ## 原 P1 口子（Q-1..Q-9）的收口
 
@@ -86,7 +99,7 @@
 | R-5 | `resolution=merged` | §9.3 未定义合并后正文归属 |
 | R-6 | 快照 JSON | P2 星图才消费 |
 | R-7 | 半衰期分档表的真实校准 | 现为先验值，需要 P1.5 的召回日志 |
-| R-8 | `explain` / `expand` 输出不按 viewer/scope 过滤；`events` 的分区列暂无读路径消费 | P1 审查 n-8：与 U4/U8 开放口径一致，不算新洞；但 P1.5 把 expand 变成 agent 工具时即成跨 session 泄漏面，接宿主前必须先定口径 |
+| R-8 | `explain` / `expand` 输出不按 viewer/scope 过滤；`events` 的分区列暂无读路径消费 | **已收口（P1.5a A-3）**。读路径与召回同一条谓词（§10.6）；v4 给 `events` 补了 `project_id`，连带数据一起过滤；CLI 留 `--show-all` 逃生口，MCP 不暴露 |
 
 ## 审查记录（P1，独立会话执行）
 

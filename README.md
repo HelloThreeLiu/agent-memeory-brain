@@ -2,7 +2,7 @@
 
 > 给 AI 助手一套**能追溯、能回滚、能看见**的记忆。本地优先，零模型也能跑。
 
-**状态：P1 生命周期可用（v0.0.2）。** 设计文档经过三轮独立评审，25 条意见全部处理。P0 落地了 schema、不变量断言、中文两因子召回与 CLI；P1 补上衰减/休眠/归档/回收站、`explain` / `expand` / `forget` / `restore` / `pin` / `sleep`，以及仲裁终态。还没有宿主接入（P1.5 起）。
+**状态：P1.5a 接入面可用（v0.0.3）。** 设计文档经过三轮独立评审，25 条意见全部处理。P0 落地了 schema、不变量断言、中文两因子召回与 CLI；P1 补上衰减/休眠/归档/回收站、`explain` / `expand` / `forget` / `restore` / `pin` / `sleep`，以及仲裁终态；P1.5a 补上 MCP 接口层（`remember` / `recall` / `expand` / `feedback` 四工具）、注入日志与反馈表、读路径可见性口径、`project_id` 解析与指令文件指针块。**还没有接真实宿主**——连续用 5 天攒日志是 P1.5b。
 
 ---
 
@@ -96,11 +96,40 @@ python -m nebula pin mem-1                 # 置顶，免于自动归档
 python -m nebula sleep --dry-run           # 只看这一轮维护会动哪些，不写库
 python -m nebula sleep                     # 衰减 / 休眠 / 归档 / 清回收站
 python -m nebula status                    # 库的规模、待维护量、回收站与置顶
+python -m nebula project                   # 当前目录解析出的 project_id（git remote 优先）
+python -m nebula pointer show              # 指令文件里那 5 行指针块
+python -m nebula pointer install --file ./CLAUDE.md   # 写入（幂等，可 uninstall）
 ```
 
 遗忘阶梯：`active --30 天未召回且 heat<0.25--> dormant --180 天且最冷 10%--> archived -->`（用户 `forget`）`deleted --30 天--> 物理删`。置顶条目全程豁免；归档、删除都退出 FTS 索引，复原时重新装回。
 
 零运行时依赖、断网可用、不需要任何 API key。库路径优先级：`--db` > `NEBULA_DB` > `~/.nebula/memory.db`。
+
+## 接入宿主（B 档：只有 MCP，靠指令块驱动）
+
+```bash
+pip install .                       # 或 pip install -e .
+python -m nebula pointer install --file ./CLAUDE.md   # 换成你的宿主读的指令文件
+```
+
+然后在宿主的 MCP 配置里加一个 stdio server：
+
+```json
+{
+  "mcpServers": {
+    "nebula": {
+      "command": "python",
+      "args": ["-m", "nebula.mcp", "--host", "claude-code"]
+    }
+  }
+}
+```
+
+Windows 上 `python` 常常不在宿主进程的 PATH 里，用解释器绝对路径最稳。可选参数：`--session`（私有分区身份）、`--project`（不给则从当前目录解析）、`--db`。
+
+四个工具的分工：`remember` 写、`recall` 召回（每次落一条注入日志）、`expand` 查来历、`feedback` 纠正（`useful`/`useless`/`wrong`）。B 档没有 hook，模型会不会主动调取决于指令块，所以工具描述里写的是"什么时候该调"。
+
+**读路径有分区**：`private` 条目只对同一 `session` 可见，`project` 条目只对同一项目可见；看不见时返回"不可见"而**不返回正文**。本机 CLI 用 `--show-all` 可以看全部，MCP 工具没有这个开关。
 
 **环境要求**：Python ≥ 3.11，SQLite ≥ 3.39（FTS5 的 `remove_diacritics 2` 与 `UPDATE … RETURNING` 需要它；CPython 3.11+ 的官方 Windows/macOS 构建自带的 SQLite 均满足，部分 Linux 发行版系统库可能偏旧，用 `python -c "import sqlite3;print(sqlite3.sqlite_version)"` 确认）。
 
@@ -110,7 +139,8 @@ python -m nebula status                    # 库的规模、待维护量、回�
 |---|---|---|
 | P0 | schema + 不变量断言 + 两因子召回 + CLI | 已完成（v0.0.1） |
 | P1 | 衰减 / 休眠 / 归档 / 回收站 / 仲裁终态 / `explain` | 已完成（v0.0.2） |
-| P1.5 | 单宿主接入，攒真实召回日志（校准阈值的唯一机会） | 未开始 |
+| P1.5a | MCP 四工具 + 注入日志/反馈 + 读路径可见性 + 指针块 | 已完成（v0.0.3） |
+| P1.5b | 接一个真实宿主，连续用 5 天，三项指标分开报告 | 待接入 |
 | P2 | 星图 v1：快照 + 宇宙视图 + 时间回放 | 未开始 |
 | P3 | 星图 v2：神经视图 + 反向治理 | 未开始 |
 | P4 | 多宿主：daemon + shim + adapter | 未开始 |
@@ -137,10 +167,12 @@ agent-memeory-brain/
 ├── nebula/          引擎
 │   ├── core/        纯逻辑：路由、打分、分词、时间（无 I/O，可穷举单测）
 │   ├── store/       schema、迁移、write_service（唯一写入口）
-│   ├── recall/      候选池谓词 + FTS5 + 一席制 + expand / explain
+│   ├── recall/      候选池谓词 + FTS5 + 一席制 + expand / explain / 可见性口径
 │   ├── lifecycle/   衰减策略与睡眠维护（写仍然只经 write_service）
+│   ├── mcp/         MCP stdio 协议层 + 四工具（零依赖，自研）
+│   ├── adapter/     project_id 解析 + 指令文件指针块
 │   └── __main__.py  CLI
-└── tests/           不变量断言、检索回归、500 轮膨胀测试
+└── tests/           不变量断言、检索回归、500 轮膨胀测试、MCP 端到端
 ```
 
 ## 参与开发

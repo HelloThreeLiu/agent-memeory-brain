@@ -17,7 +17,8 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -34,7 +35,9 @@ DEDUP_WINDOW_SECONDS = 60
 #: merge 时的权重强化幅度（§9.2）
 MERGE_WEIGHT_STEP = 0.08
 
-#: 回收站保留期（§9.5）：进回收站 30 天内可复原，之后才允许硬删（INV10）
+#: 回收站保留期（§9.5 / INV10）：进回收站 30 天内可复原，之后才允许硬删。
+#: 放在写入层而不是 lifecycle，是因为 restore / purge 的边界判定就在这里，
+#: 策略层只是跟着它算"有多少条可清"。
 RECYCLE_WINDOW_DAYS = 30
 
 #: 归档原因白名单（与 schema 的 CHECK 一致）
@@ -43,6 +46,13 @@ ARCHIVE_REASONS: tuple[str, ...] = ("decay", "capacity", "refuted")
 #: 裁决结论。``merged`` 在 §8.1 的枚举里，但 §9.3 没定义合并后的正文归属，
 #: P1 不开放——宁可显式拒绝，也不猜一个"合并"出来（见 resolve_arbitration）。
 RESOLUTIONS: tuple[str, ...] = ("left", "right", "both")
+
+#: 批量状态迁移的白名单：目标状态 → 允许的前态（防止批量接口变成任意改 status）
+_STATUS_TRANSITIONS: dict[str, tuple[str, ...]] = {
+    "dormant": ("active",),
+    "archived": ("active", "dormant"),
+    "deleted": ("active", "dormant", "archived"),
+}
 
 
 class InvariantViolation(RuntimeError):
@@ -115,6 +125,25 @@ class WriteService:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
 
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """事务边界；已在事务里时**复用**而不是嵌套开新事务。
+
+        睡眠周期要把"衰减 + 休眠 + 归档 + 清回收站"一次提交：只落一半比完全
+        没跑更难排查。SQLite 不支持嵌套 ``BEGIN``，所以这里用 ``in_transaction``
+        判断是否需要自己开。
+        """
+        if self._conn.in_transaction:
+            yield
+            return
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+
     # ------------------------------------------------------------------ 写入
 
     def remember(
@@ -179,9 +208,8 @@ class WriteService:
                 raise ValueError(f"valid_from 不是可解析的时间：{valid_from!r}")
             start = fmt(parsed)
 
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            result = self._write_locked(
+        with self.transaction():
+            return self._write_locked(
                 text=text,
                 scope=scope,
                 project_id=project_id,
@@ -202,11 +230,6 @@ class WriteService:
                 evidence=evidence,
                 pinned=pinned,
             )
-            self._conn.execute("COMMIT")
-        except Exception:
-            self._conn.execute("ROLLBACK")
-            raise
-        return result
 
     # -------------------------------------------------------------- 生命周期
 
@@ -232,8 +255,7 @@ class WriteService:
         stamp = fmt(now) if now is not None else now_ts()
         encoded = json.dumps(list(ids), ensure_ascii=False)
         touched = 0
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
+        with self.transaction():
             rows = self._conn.execute(
                 """
                 SELECT id, seq, scope, visibility FROM memories
@@ -266,10 +288,6 @@ class WriteService:
                         visibility=str(row["visibility"]),
                     )
             touched = len(rows)
-            self._conn.execute("COMMIT")
-        except Exception:
-            self._conn.execute("ROLLBACK")
-            raise
         return touched
 
     def pin(
@@ -444,8 +462,7 @@ class WriteService:
         ids = [str(row["id"]) for row in rows]
         encoded = json.dumps(ids, ensure_ascii=False)
         event_seq = self._current_seq()
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
+        with self.transaction():
             self._conn.execute(
                 "DELETE FROM memory_links WHERE src IN (SELECT value FROM json_each(?)) "
                 "OR dst IN (SELECT value FROM json_each(?))",
@@ -473,10 +490,6 @@ class WriteService:
                 None,
                 {"count": len(ids)},
             )
-            self._conn.execute("COMMIT")
-        except Exception:
-            self._conn.execute("ROLLBACK")
-            raise
         return len(ids)
 
     def resolve_arbitration(
@@ -507,8 +520,7 @@ class WriteService:
             )
         stamp = fmt(now) if now is not None else now_ts()
         winner_id = ""
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
+        with self.transaction():
             arb = self._conn.execute(
                 "SELECT id, left_id, right_id, status, scope, visibility "
                 "FROM arbitration WHERE id = ?",
@@ -548,11 +560,116 @@ class WriteService:
                 scope=str(arb["scope"]),
                 visibility=str(arb["visibility"]),
             )
-            self._conn.execute("COMMIT")
-        except Exception:
-            self._conn.execute("ROLLBACK")
-            raise
         return winner_id
+
+    def apply_heat(
+        self,
+        updates: Sequence[tuple[str, float]],
+        *,
+        now: datetime | None = None,
+        host: str | None = None,
+        session_id: str | None = None,
+    ) -> int:
+        """批量结算 heat（衰减的执行器）。整批一个事务，只记一条汇总事件。
+
+        逐条记事件会让 2000 条的库每个睡眠周期产出 2000 行审计噪音，而
+        "这一次结算改了哪些行"用 count + 结算时刻就够追溯了。
+        """
+        if not updates:
+            return 0
+        stamp = fmt(now) if now is not None else now_ts()
+        batch = [(max(0.0, heat), stamp, memory_id) for memory_id, heat in updates]
+        changed = 0
+        with self.transaction():
+            cursor = self._conn.executemany(
+                "UPDATE memories SET heat = ?, decayed_at = ? WHERE id = ?", batch
+            )
+            changed = int(cursor.rowcount)
+            self._log_event(
+                self._current_seq(),
+                stamp,
+                host,
+                session_id,
+                "memory.heat_settled",
+                None,
+                {"count": changed},
+            )
+        return changed
+
+    def sweep_status(
+        self,
+        memory_ids: Sequence[str],
+        target: str,
+        *,
+        reason: str | None = None,
+        now: datetime | None = None,
+        host: str | None = None,
+        session_id: str | None = None,
+    ) -> int:
+        """批量状态迁移（休眠 / 归档 / 进回收站），一个事务、一条汇总事件。
+
+        目标状态与允许的前态是白名单（``_STATUS_TRANSITIONS``）。批量接口一旦
+        能任意写 status，INV3（不硬删）与 INV10（30 天可复原）就只剩注释了。
+        """
+        ids = tuple(dict.fromkeys(memory_ids))
+        if not ids:
+            return 0
+        allowed = _STATUS_TRANSITIONS.get(target)
+        if allowed is None:
+            raise ValueError(
+                f"批量迁移不支持目标状态：{target!r}，可选 {tuple(_STATUS_TRANSITIONS)}"
+            )
+        if target == "archived" and reason not in ARCHIVE_REASONS:
+            raise ValueError(f"未知的归档原因：{reason!r}，可选 {ARCHIVE_REASONS}")
+
+        stamp = fmt(now) if now is not None else now_ts()
+        encoded = json.dumps(list(ids), ensure_ascii=False)
+        if target == "dormant":
+            clause = "status = 'dormant'"
+            extra: tuple[object, ...] = ()
+        elif target == "archived":
+            clause = "status = 'archived', archived_at = ?, archived_reason = ?"
+            extra = (stamp, reason)
+        else:
+            clause = "status = 'deleted', deleted_at = ?"
+            extra = (stamp,)
+        previous = ",".join("?" for _ in allowed)
+        # 先按下标取出真正会被改到的行：ids 里可能混着已归档或已删除的，
+        # 事件里的 count 必须与 UPDATE 实际影响的行数对得上
+        rows = self._conn.execute(
+            "SELECT id, seq, scope, visibility FROM memories "
+            "WHERE id IN (SELECT value FROM json_each(?)) "
+            f"AND status IN ({previous})",
+            (encoded, *allowed),
+        ).fetchall()
+        if not rows:
+            return 0
+        live = json.dumps([str(row["id"]) for row in rows], ensure_ascii=False)
+        changed = 0
+        with self.transaction():
+            cursor = self._conn.execute(
+                f"UPDATE memories SET {clause} "
+                "WHERE id IN (SELECT value FROM json_each(?)) "
+                f"AND status IN ({previous})",
+                (*extra, live, *allowed),
+            )
+            changed = int(cursor.rowcount)
+            if target in ("archived", "deleted"):
+                self._conn.execute(
+                    "DELETE FROM memories_fts "
+                    "WHERE memory_id IN (SELECT value FROM json_each(?))",
+                    (live,),
+                )
+            self._log_event(
+                self._current_seq(),
+                stamp,
+                host,
+                session_id,
+                "memory.status_swept",
+                None,
+                {"target": target, "count": changed, "reason": reason},
+            )
+        return changed
 
     # ------------------------------------------------------------------ 内部
 
@@ -1072,8 +1189,8 @@ class WriteService:
         ).fetchone()
         if row is None:
             raise ValueError(f"没有这条记忆：{memory_id}")
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
+        changed = False
+        with self.transaction():
             cursor = self._conn.execute(sql, params)
             changed = int(cursor.rowcount) > 0
             if changed:
@@ -1096,10 +1213,6 @@ class WriteService:
                     scope=str(row["scope"]),
                     visibility=str(row["visibility"]),
                 )
-            self._conn.execute("COMMIT")
-        except Exception:
-            self._conn.execute("ROLLBACK")
-            raise
         return changed
 
     def _fact_row(self, memory_id: str) -> sqlite3.Row | None:

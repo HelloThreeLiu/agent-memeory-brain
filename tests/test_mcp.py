@@ -169,6 +169,31 @@ def test_feedback_does_not_mislink_prefix_ids(
     assert row["injection_id"] == right
 
 
+def test_loose_project_defaults_to_global_scope(conn: sqlite3.Connection) -> None:
+    """非 git 目录的 id 是路径 hash，换路径就失效——不该拿它当作用域边界。"""
+    loose = Server(
+        ToolContext(conn=conn, host="h", project_id="loose-hash", project_is_loose=True)
+    )
+    _call(
+        loose,
+        60,
+        "tools/call",
+        {"name": "remember", "arguments": {"content": "非 git 目录里的偏好"}},
+    )
+    row = conn.execute("SELECT scope, project_id FROM memories").fetchone()
+    assert row["scope"] == "global"
+    assert row["project_id"] is None
+
+    # 想按目录分项目必须显式给 id，不能让系统拿 loose hash 猜
+    rejected = _call(
+        loose,
+        61,
+        "tools/call",
+        {"name": "remember", "arguments": {"content": "硬要分项目", "scope": "project"}},
+    )
+    assert rejected["result"]["isError"] is True
+
+
 def test_private_memory_is_not_expandable_by_another_session(
     conn: sqlite3.Connection,
 ) -> None:

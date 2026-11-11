@@ -47,14 +47,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    project_id = args.project or resolve_project().project_id
+    ref = resolve_project()
     conn = open_database(args.db)
     try:
         ctx = ToolContext(
             conn=conn,
             host=args.host,
             session_id=args.session,
-            project_id=project_id,
+            project_id=args.project or ref.project_id,
+            project_is_loose=ref.is_loose and not args.project,
         )
         run(ctx)
     finally:

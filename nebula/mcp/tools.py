@@ -46,11 +46,20 @@ class ToolContext:
     host: str | None = None
     session_id: str | None = None
     project_id: str | None = None
+    #: ``project_id`` 是"非 git 目录的路径 hash"（§10.4 loose）。这种 id 换路径就失效，
+    #: 拿它当作用域边界会让记忆绑在一个假项目上，所以读过滤与写入默认都退回 global。
+    project_is_loose: bool = False
+
+    @property
+    def effective_project_id(self) -> str | None:
+        return None if self.project_is_loose else self.project_id
 
     @property
     def viewer(self) -> Viewer:
         return Viewer(
-            session_id=self.session_id, project_id=self.project_id, host=self.host
+            session_id=self.session_id,
+            project_id=self.effective_project_id,
+            host=self.host,
         )
 
 
@@ -144,17 +153,17 @@ def _remember(arguments: dict[str, Any], ctx: ToolContext) -> str:
         arguments,
         "scope",
         ("global", "project", "host"),
-        "project" if ctx.project_id else "global",
+        "project" if ctx.effective_project_id else "global",
     )
     project_id = _optional_string(arguments, "project_id")
 
     if scope == "global":
         project_id = None
     elif scope == "project":
-        project_id = project_id or ctx.project_id
+        project_id = project_id or ctx.effective_project_id
         if project_id is None:
             raise ValueError(
-                "scope=project 需要项目上下文：当前目录解析不出项目，"
+                "scope=project 需要项目上下文：当前目录不是 git 仓库（或解析不出项目），"
                 "请显式传 project_id 或改用 scope=global"
             )
 
@@ -203,7 +212,7 @@ def _recall(arguments: dict[str, Any], ctx: ToolContext) -> str:
         ctx.conn,
         query,
         limit,
-        project_id=ctx.project_id,
+        project_id=ctx.effective_project_id,
         viewer_session=ctx.session_id,
         record=True,
     )
@@ -219,7 +228,7 @@ def _recall(arguments: dict[str, Any], ctx: ToolContext) -> str:
         top_k=limit,
         host=ctx.host,
         session_id=ctx.session_id,
-        project_id=ctx.project_id,
+        project_id=ctx.effective_project_id,
         degraded_level=1 if result.degraded else 0,
         elapsed_ms=result.elapsed_ms,
     )

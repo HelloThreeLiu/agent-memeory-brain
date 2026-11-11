@@ -38,7 +38,7 @@
 
 **实测结果（2026-11-11，本机 Python 3.13.14 / SQLite 3.53.1）**
 
-- 门禁：`ruff` 0 问题 / `mypy --strict` 0 问题 / `pytest` **178 passed**（审查修复后复跑）/ `python -m build` 出 wheel（零运行时依赖，`pip-audit` 按 CI 口径跳过）。
+- 门禁：`ruff` 0 问题 / `mypy --strict` 0 问题 / `pytest` **180 passed**（两轮审查修复后复跑）/ `python -m build` 出 wheel（零运行时依赖，`pip-audit` 按 CI 口径跳过）。
 - 检索基线：20 查询 hit@5 **19/20 = 95%**，与 P0 完全一致——加 weight/confidence 两项因子没掉点；p50 0.34ms、p95 0.49ms（`record=False`，纯检索）。
 - 500 轮压测（每轮 3 写 + 1 召回，每 50 轮一次 sleep，共 1500 条、时间跨度 1500 天）：总量 1500 一条不丢；活跃 **270**（把软上限压到 300 来测容量机制）；归档 1230（`capacity` 1036 / `decay` 194）；FTS 行数 = 活跃条数（归档条目不占索引）。
 - 回收站往返：29 天可复原、31 天拒绝；`purge_expired` 只删超期行，且先清 links / arbitration 再删主体。
@@ -86,8 +86,12 @@
 | n-6 | Nit | `except` 里 ROLLBACK 未判 `in_transaction`，SQLITE_FULL/IOERR 类错误会顶掉原始异常 | 加守卫 | 全量用例绿 |
 | n-7 | Nit | `sweep_status` 的 `deleted` 分支无生产调用、无用例 | 补两条用例（正向落库 + 白名单拒绝） | `test_sweep_status_moves_rows_to_the_recycle_bin` / `..._rejects_targets_outside_the_whitelist` |
 | n-8 | Nit | explain/expand 不按 viewer/scope 过滤；events 分区列暂无读路径消费 | 不改，与 U4/U8 口径一致 | 登记为 R-8 |
+| m-9 | Minor | 同刻几何：§9.3 写"时刻相同 → 裁决时刻"，实现用 `>=`（含相等）走"赢家生效时刻"，得到零宽区间 `[t, t)`，丢掉"对子存续过"的记录 | 规格是对的，代码差一个字符：`>=` 改 `>`。同刻与"赢家更早"同归裁决时刻 | `test_resolve_same_moment_uses_the_decision_time`：同刻对子裁 left 得 `t → t+2d`；回退为 `>=` 时该用例变红（实跑：得到 `2026-05-01`，期望 `2026-05-03`） |
+| m-10 | Minor | m-3 修复无回归用例（WORKFLOW ④"没有用例的修复视为未完成"） | 补用例的同时发现修复不完整：扫描后若条目被复原，`DELETE memories` 的条件会跳过它，但 links / arbitration / FTS 已按旧 id 删掉，留下"主体还在、却搜不到也没有关联"的不一致。补二次确认：只按"此刻仍是超期 deleted"的 id 清附属数据 | `test_purge_skips_rows_restored_after_the_scan`：扫描后注入一次 restore，断言 `purged=0`、状态 `active`、FTS 与 links 都还在；改成按扫描结果直接删时用例变红（实跑：`purged` 得到 1） |
 
-**修复后复验（2026-11-11）**：`ruff` 0 / `mypy` 0（20 文件）/ `pytest` **178 passed** / 16 格路由表 **38 passed** / 仲裁三态 **8 passed** / `python -m build` 出 `nebula_memory-0.0.2` wheel。
+**修复后复验（2026-11-11）**：`ruff` 0 / `mypy` 0（20 文件）/ `pytest` **180 passed** / 16 格路由表 **38 passed** / 仲裁三态 **8 passed** / `python -m build` 出 `nebula_memory-0.0.2` wheel。
+
+第二轮复查（同日，独立会话）结论「通过」，两条 Minor 记档后已在本批收口：m-9（同刻几何差一个字符）、m-10（m-3 缺回归用例，补用例时顺带补了 `purge` 的二次确认）。
 
 ## 审查记录（P0 首轮，独立会话执行）
 

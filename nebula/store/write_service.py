@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -32,6 +33,16 @@ DEDUP_WINDOW_SECONDS = 60
 
 #: merge 时的权重强化幅度（§9.2）
 MERGE_WEIGHT_STEP = 0.08
+
+#: 回收站保留期（§9.5）：进回收站 30 天内可复原，之后才允许硬删（INV10）
+RECYCLE_WINDOW_DAYS = 30
+
+#: 归档原因白名单（与 schema 的 CHECK 一致）
+ARCHIVE_REASONS: tuple[str, ...] = ("decay", "capacity", "refuted")
+
+#: 裁决结论。``merged`` 在 §8.1 的枚举里，但 §9.3 没定义合并后的正文归属，
+#: P1 不开放——宁可显式拒绝，也不猜一个"合并"出来（见 resolve_arbitration）。
+RESOLUTIONS: tuple[str, ...] = ("left", "right", "both")
 
 
 class InvariantViolation(RuntimeError):
@@ -197,6 +208,352 @@ class WriteService:
             raise
         return result
 
+    # -------------------------------------------------------------- 生命周期
+
+    def touch_recall(
+        self,
+        memory_ids: Sequence[str],
+        *,
+        now: datetime | None = None,
+        host: str | None = None,
+        session_id: str | None = None,
+    ) -> int:
+        """召回记账：``last_recalled`` / ``recall_count``，并唤醒 dormant。
+
+        §9.2 的晋升触发（``recall_count ≥ 3``）与 §9.5 的衰减/auto-archive 全依赖
+        这两个字段（BACKLOG Q-8）。调用方只应传**相关性已达唤醒阈值**的命中——
+        ``dormant → active`` 的判据是"被真的想起来了"，不是"被扫进候选池"。
+
+        读路径要写库也必须走本模块，不允许 recall 自己 UPDATE（INV1）。
+        """
+        ids = tuple(dict.fromkeys(memory_ids))
+        if not ids:
+            return 0
+        stamp = fmt(now) if now is not None else now_ts()
+        encoded = json.dumps(list(ids), ensure_ascii=False)
+        touched = 0
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = self._conn.execute(
+                """
+                SELECT id, seq, scope, visibility FROM memories
+                WHERE id IN (SELECT value FROM json_each(?))
+                  AND status IN ('active', 'dormant')
+                """,
+                (encoded,),
+            ).fetchall()
+            if rows:
+                self._conn.execute(
+                    """
+                    UPDATE memories
+                    SET last_recalled = ?, recall_count = recall_count + 1,
+                        status = CASE WHEN status = 'dormant' THEN 'active' ELSE status END
+                    WHERE id IN (SELECT value FROM json_each(?))
+                      AND status IN ('active', 'dormant')
+                    """,
+                    (stamp, encoded),
+                )
+                for row in rows:
+                    self._log_event(
+                        int(row["seq"]),
+                        stamp,
+                        host,
+                        session_id,
+                        "memory.recalled",
+                        str(row["id"]),
+                        None,
+                        scope=str(row["scope"]),
+                        visibility=str(row["visibility"]),
+                    )
+            touched = len(rows)
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return touched
+
+    def pin(
+        self,
+        memory_id: str,
+        *,
+        pinned: bool = True,
+        now: datetime | None = None,
+        host: str | None = None,
+        session_id: str | None = None,
+    ) -> bool:
+        """置顶/取消置顶。返回是否真的改了。
+
+        置顶同时豁免 auto-archive 与触顶归档（§9.5）——用户说"这条别动"就该别动。
+        """
+        stamp = fmt(now) if now is not None else now_ts()
+        return self._mutate(
+            memory_id,
+            stamp,
+            host,
+            session_id,
+            "memory.pinned" if pinned else "memory.unpinned",
+            "UPDATE memories SET pinned = ? WHERE id = ? AND pinned <> ?",
+            (1 if pinned else 0, memory_id, 1 if pinned else 0),
+        )
+
+    def archive(
+        self,
+        memory_id: str,
+        *,
+        reason: str = "decay",
+        now: datetime | None = None,
+        host: str | None = None,
+        session_id: str | None = None,
+    ) -> bool:
+        """归档（可逆，INV3 只禁硬删）。归档条目同时退出 FTS 索引（Q-5）。"""
+        if reason not in ARCHIVE_REASONS:
+            raise ValueError(f"未知的归档原因：{reason!r}，可选 {ARCHIVE_REASONS}")
+        stamp = fmt(now) if now is not None else now_ts()
+        changed = self._mutate(
+            memory_id,
+            stamp,
+            host,
+            session_id,
+            "memory.archived",
+            """
+            UPDATE memories
+            SET status = 'archived', archived_at = ?, archived_reason = ?
+            WHERE id = ? AND status IN ('active', 'dormant')
+            """,
+            (stamp, reason, memory_id),
+            payload={"reason": reason},
+            fts="drop",
+        )
+        return changed
+
+    def unarchive(
+        self,
+        memory_id: str,
+        *,
+        now: datetime | None = None,
+        host: str | None = None,
+        session_id: str | None = None,
+    ) -> bool:
+        """从归档复原：状态回 active，并把正文重新装回 FTS。"""
+        stamp = fmt(now) if now is not None else now_ts()
+        return self._mutate(
+            memory_id,
+            stamp,
+            host,
+            session_id,
+            "memory.unarchived",
+            """
+            UPDATE memories
+            SET status = 'active', archived_at = NULL, archived_reason = NULL
+            WHERE id = ? AND status = 'archived'
+            """,
+            (memory_id,),
+            fts="rebuild",
+        )
+
+    def forget(
+        self,
+        memory_id: str,
+        *,
+        now: datetime | None = None,
+        host: str | None = None,
+        session_id: str | None = None,
+    ) -> bool:
+        """遗忘 = 进回收站，不物理删除（INV10：30 天内可复原）。"""
+        stamp = fmt(now) if now is not None else now_ts()
+        changed = self._mutate(
+            memory_id,
+            stamp,
+            host,
+            session_id,
+            "memory.forgotten",
+            """
+            UPDATE memories
+            SET status = 'deleted', deleted_at = ?
+            WHERE id = ? AND status IN ('active', 'dormant', 'archived')
+            """,
+            (stamp, memory_id),
+            fts="drop",
+        )
+        return changed
+
+    def restore(
+        self,
+        memory_id: str,
+        *,
+        now: datetime | None = None,
+        host: str | None = None,
+        session_id: str | None = None,
+    ) -> bool:
+        """从回收站复原。超过 30 天窗口抛错——静默失败会让人以为"还在"。
+
+        只认 ``status='deleted'`` 且 ``deleted_at`` 在窗口内的行。``deleted_at``
+        缺失（P0 老库手工改成 deleted 的行）按"无窗口信息"处理：允许复原，
+        因为拒绝复原比多留一条更难解释。
+        """
+        stamp_dt = now if now is not None else None
+        stamp = fmt(stamp_dt) if stamp_dt is not None else now_ts()
+        row = self._conn.execute(
+            "SELECT deleted_at FROM memories WHERE id = ? AND status = 'deleted'",
+            (memory_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        deleted_at = parse_ts(None if row["deleted_at"] is None else str(row["deleted_at"]))
+        if deleted_at is not None:
+            elapsed = (parse_ts(stamp) or deleted_at) - deleted_at
+            if elapsed.days >= RECYCLE_WINDOW_DAYS:
+                raise ValueError(
+                    f"{memory_id} 已超过回收站 {RECYCLE_WINDOW_DAYS} 天窗口，不能复原"
+                )
+        changed = self._mutate(
+            memory_id,
+            stamp,
+            host,
+            session_id,
+            "memory.restored",
+            "UPDATE memories SET status = 'active', deleted_at = NULL "
+            "WHERE id = ? AND status = 'deleted'",
+            (memory_id,),
+            fts="rebuild",
+        )
+        return changed
+
+    def purge_expired(
+        self,
+        *,
+        now: datetime | None = None,
+        host: str | None = None,
+        session_id: str | None = None,
+    ) -> int:
+        """硬删超期回收站条目。这是全系统唯一允许物理删除记忆的地方。
+
+        先清链接与仲裁再删主体：``memory_links`` 与 ``arbitration`` 对 ``memories``
+        有外键，顺序错了会撞 ``FOREIGN KEY constraint failed``。仲裁行不是审计底账
+        （``events`` 才是），跟着一起清掉不会丢"谁跟谁争过"这件事——它在 event 里。
+        """
+        stamp = fmt(now) if now is not None else now_ts()
+        cutoff = _days_before(stamp, RECYCLE_WINDOW_DAYS)
+        rows = self._conn.execute(
+            "SELECT id, seq, scope, visibility FROM memories "
+            "WHERE status = 'deleted' AND deleted_at IS NOT NULL AND deleted_at <= ?",
+            (cutoff,),
+        ).fetchall()
+        if not rows:
+            return 0
+        ids = [str(row["id"]) for row in rows]
+        encoded = json.dumps(ids, ensure_ascii=False)
+        event_seq = self._current_seq()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                "DELETE FROM memory_links WHERE src IN (SELECT value FROM json_each(?)) "
+                "OR dst IN (SELECT value FROM json_each(?))",
+                (encoded, encoded),
+            )
+            self._conn.execute(
+                "DELETE FROM arbitration WHERE left_id IN (SELECT value FROM json_each(?)) "
+                "OR right_id IN (SELECT value FROM json_each(?))",
+                (encoded, encoded),
+            )
+            self._conn.execute(
+                "DELETE FROM memories_fts WHERE memory_id IN (SELECT value FROM json_each(?))",
+                (encoded,),
+            )
+            self._conn.execute(
+                "DELETE FROM memories WHERE id IN (SELECT value FROM json_each(?)) ",
+                (encoded,),
+            )
+            self._log_event(
+                event_seq,
+                stamp,
+                host,
+                session_id,
+                "memory.purged",
+                None,
+                {"count": len(ids)},
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return len(ids)
+
+    def resolve_arbitration(
+        self,
+        arbitration_id: str,
+        resolution: str,
+        *,
+        by: str = "user",
+        now: datetime | None = None,
+        host: str | None = None,
+        session_id: str | None = None,
+    ) -> str:
+        """人工裁决一条 open 仲裁，返回胜出条 id（``both`` 时返回空串）。
+
+        §9.3 的终态三条：
+        - 输家写 ``valid_to`` = 赢家 ``valid_from`` + ``expired_at`` + ``superseded_by``，
+          **行保留、status 不变**（双时间轴，历史可查）；
+        - 输家是 claim → ``status=archived``、``archived_reason=refuted``；
+        - ``resolution=both``：两段时间各自成立，两条都不动。
+
+        输家若已经失效（``expired_at`` 非空），不再重写——INV3 的触发器会直接
+        ABORT，这里提前跳过，把"为什么没动它"留在 event 里。
+        """
+        if resolution not in RESOLUTIONS:
+            raise ValueError(
+                f"不支持的裁决结论：{resolution!r}。P1 只开放 {RESOLUTIONS}；"
+                "merged 在 §9.3 没有定义合并后的正文归属，不猜"
+            )
+        stamp = fmt(now) if now is not None else now_ts()
+        winner_id = ""
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            arb = self._conn.execute(
+                "SELECT id, left_id, right_id, status, scope, visibility "
+                "FROM arbitration WHERE id = ?",
+                (arbitration_id,),
+            ).fetchone()
+            if arb is None:
+                raise ValueError(f"没有这条仲裁：{arbitration_id}")
+            if str(arb["status"]) != "open":
+                raise ValueError(f"仲裁 {arbitration_id} 已经裁决过，不再重复落终态")
+
+            if resolution in ("left", "right"):
+                winner_id = str(arb["left_id"] if resolution == "left" else arb["right_id"])
+                loser_id = str(arb["right_id"] if resolution == "left" else arb["left_id"])
+                winner = self._fact_row(winner_id)
+                if winner is None:
+                    raise ValueError(f"胜出条 {winner_id} 不存在，无法裁决")
+                if not _covers_now(winner, stamp):
+                    raise ValueError(f"胜出条 {winner_id} 已不在有效区间，裁决没有意义")
+                self._retire_loser(loser_id, winner, stamp, host, session_id)
+
+            self._conn.execute(
+                """
+                UPDATE arbitration
+                SET status = 'resolved', resolution = ?, resolved_by = ?, resolved_at = ?
+                WHERE id = ?
+                """,
+                (resolution, by, stamp, arbitration_id),
+            )
+            self._log_event(
+                self._current_seq(),
+                stamp,
+                host,
+                session_id,
+                "arbitration.resolved",
+                arbitration_id,
+                {"resolution": resolution, "by": by, "winner": winner_id},
+                scope=str(arb["scope"]),
+                visibility=str(arb["visibility"]),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return winner_id
+
     # ------------------------------------------------------------------ 内部
 
     def _write_locked(
@@ -271,7 +628,16 @@ class WriteService:
         old = self._current_in_slot(draft) if fact_key else None
         if old is None:
             self._insert(draft, valid_to=None, superseded_by=None)
-            self._log_event(draft.seq, created_at, host, session_id, "memory.created", draft.id)
+            self._log_event(
+                draft.seq,
+                created_at,
+                host,
+                session_id,
+                "memory.created",
+                draft.id,
+                scope=draft.scope,
+                visibility=draft.visibility,
+            )
             return WriteResult(id=draft.id, action="created", seq=draft.seq, note=draft.id)
 
         decision = conflict.route(_view_of(draft), old)
@@ -324,7 +690,16 @@ class WriteService:
         )
         memory_id = str(row["id"])
         seq = int(row["seq"])
-        self._log_event(seq, created_at, host, session_id, "memory.deduplicated", memory_id)
+        self._log_event(
+            seq,
+            created_at,
+            host,
+            session_id,
+            "memory.deduplicated",
+            memory_id,
+            scope=scope,
+            visibility=visibility,
+        )
         return WriteResult(
             id=memory_id,
             action="deduplicated",
@@ -420,11 +795,13 @@ class WriteService:
                 old.id,
                 {
                     "reason": decision.reason,
-                    # 只存摘要不存正文：events 没有 scope/visibility 列，
+                    # 只存摘要不存正文：events 里的 payload 也可能被导出，
                     # 存原文会让 private 记忆从审计表里漏出去
                     "incoming_hash": draft.digest,
                     "upgraded": upgraded,
                 },
+                scope=draft.scope,
+                visibility=draft.visibility,
             )
             return WriteResult(
                 id=old.id,
@@ -445,6 +822,8 @@ class WriteService:
                 "memory.superseded_new",
                 draft.id,
                 {"reason": decision.reason, "kept": old.id},
+                scope=draft.scope,
+                visibility=draft.visibility,
             )
             return WriteResult(
                 id=draft.id,
@@ -513,6 +892,8 @@ class WriteService:
             f"memory.{action}",
             draft.id,
             {"reason": decision.reason, "old": old.id, "state": decision.state},
+            scope=draft.scope,
+            visibility=draft.visibility,
         )
         return WriteResult(
             id=draft.id,
@@ -588,6 +969,8 @@ class WriteService:
             "arbitration.auto_resolved",
             arbitration_id,
             {"resolution": resolution, "by": "system:b-route"},
+            scope=draft.scope,
+            visibility=draft.visibility,
         )
 
     def _insert(self, draft: _Draft, *, valid_to: str | None, superseded_by: str | None) -> None:
@@ -666,6 +1049,140 @@ class WriteService:
             (memory_id, index_text(content)),
         )
 
+    def _mutate(
+        self,
+        memory_id: str,
+        stamp: str,
+        host: str | None,
+        session_id: str | None,
+        event_type: str,
+        sql: str,
+        params: tuple[object, ...],
+        *,
+        payload: dict[str, object] | None = None,
+        fts: str | None = None,
+    ) -> bool:
+        """单条状态变更的统一外壳：存在性检查 + 事务 + event + FTS 维护。
+
+        ``fts`` 必须和状态变更在**同一个事务**里做：分成两次提交的话，
+        状态已改而索引没改（或反过来），库与索引就不一致了，而且没有报错。
+        """
+        row = self._conn.execute(
+            "SELECT seq, scope, visibility FROM memories WHERE id = ?", (memory_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"没有这条记忆：{memory_id}")
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = self._conn.execute(sql, params)
+            changed = int(cursor.rowcount) > 0
+            if changed:
+                if fts == "drop":
+                    self._conn.execute("DELETE FROM memories_fts WHERE memory_id = ?", (memory_id,))
+                elif fts == "rebuild":
+                    content = self._conn.execute(
+                        "SELECT content FROM memories WHERE id = ?", (memory_id,)
+                    ).fetchone()
+                    if content is not None:
+                        self._rewrite_index(memory_id, str(content["content"]))
+                self._log_event(
+                    int(row["seq"]),
+                    stamp,
+                    host,
+                    session_id,
+                    event_type,
+                    memory_id,
+                    payload,
+                    scope=str(row["scope"]),
+                    visibility=str(row["visibility"]),
+                )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return changed
+
+    def _fact_row(self, memory_id: str) -> sqlite3.Row | None:
+        row: sqlite3.Row | None = self._conn.execute(
+            "SELECT id, seq, assertion_type, status, valid_from, valid_to, expired_at, "
+            "scope, visibility FROM memories WHERE id = ?",
+            (memory_id,),
+        ).fetchone()
+        return row
+
+    def _retire_loser(
+        self,
+        loser_id: str,
+        winner: sqlite3.Row,
+        stamp: str,
+        host: str | None,
+        session_id: str | None,
+    ) -> None:
+        """裁决终态：让输家退出"当前"，但行保留（§9.3）。
+
+        ``expired_at`` 一旦写过就不可改（INV3 触发器），所以已经失效的输家只记
+        一条事件、不重写——重复裁决不该撞出 ABORT。
+        """
+        loser = self._fact_row(loser_id)
+        if loser is None:  # pragma: no cover - 仲裁对子有外键，正常不会缺
+            return
+        scope = str(loser["scope"])
+        visibility = str(loser["visibility"])
+        if loser["expired_at"] is not None:
+            self._log_event(
+                int(loser["seq"]),
+                stamp,
+                host,
+                session_id,
+                "arbitration.loser_already_expired",
+                loser_id,
+                {"keeper": str(winner["id"])},
+                scope=scope,
+                visibility=visibility,
+            )
+            return
+
+        start = winner["valid_from"]
+        boundary = stamp if start is None else str(start)
+        refuted = str(loser["assertion_type"]) == "claim"
+        self._conn.execute(
+            """
+            UPDATE memories
+            SET valid_to = ?, expired_at = ?, superseded_by = ?
+            WHERE id = ?
+            """,
+            (boundary, stamp, str(winner["id"]), loser_id),
+        )
+        self._link(str(winner["id"]), loser_id, "supersedes")
+        if refuted and str(loser["status"]) != "deleted":
+            self._conn.execute(
+                """
+                UPDATE memories
+                SET status = 'archived', archived_reason = 'refuted', archived_at = ?
+                WHERE id = ? AND status IN ('active', 'dormant')
+                """,
+                (stamp, loser_id),
+            )
+            self._conn.execute("DELETE FROM memories_fts WHERE memory_id = ?", (loser_id,))
+        self._log_event(
+            int(loser["seq"]),
+            stamp,
+            host,
+            session_id,
+            "arbitration.loser_retired",
+            loser_id,
+            {"superseded_by": str(winner["id"]), "refuted": refuted},
+            scope=scope,
+            visibility=visibility,
+        )
+
+    def _drop_index(self, memory_id: str) -> None:
+        self._conn.execute("DELETE FROM memories_fts WHERE memory_id = ?", (memory_id,))
+
+    def _current_seq(self) -> int:
+        row = self._conn.execute("SELECT value FROM counter WHERE name = 'seq'").fetchone()
+        return int(row["value"]) if row is not None else 0
+
     def _log_event(
         self,
         seq: int,
@@ -675,11 +1192,14 @@ class WriteService:
         event_type: str,
         target: str | None,
         payload: dict[str, object] | None = None,
+        *,
+        scope: str | None = None,
+        visibility: str | None = None,
     ) -> None:
         self._conn.execute(
             """
-            INSERT INTO events (seq, ts, host, session, type, target, payload)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO events (seq, ts, host, session, type, target, payload, scope, visibility)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 seq,
@@ -689,8 +1209,33 @@ class WriteService:
                 event_type,
                 target,
                 None if payload is None else json.dumps(payload, ensure_ascii=False),
+                scope,
+                visibility,
             ),
         )
+
+
+def _days_before(stamp: str, days: int) -> str:
+    parsed = parse_ts(stamp)
+    if parsed is None:  # pragma: no cover - stamp 由 fmt 生成，一定可解析
+        return stamp
+    from datetime import timedelta
+
+    return fmt(parsed - timedelta(days=days))
+
+
+def _covers_now(row: sqlite3.Row, stamp: str) -> bool:
+    """这一行是否落在当前有效区间内（与 §9.4 候选池谓词同口径）。"""
+    if str(row["status"]) not in ("active", "dormant"):
+        return False
+    now = parse_ts(stamp)
+    if now is None:  # pragma: no cover
+        return False
+    start = parse_ts(None if row["valid_from"] is None else str(row["valid_from"]))
+    end = parse_ts(None if row["valid_to"] is None else str(row["valid_to"]))
+    if start is not None and start > now:
+        return False
+    return end is None or end > now
 
 
 def _within_window(previous: str, current: str) -> bool:

@@ -25,8 +25,26 @@ from nebula.lifecycle.sleep import run_sleep
 from nebula.recall.detail import expand
 from nebula.recall.explain import explain
 from nebula.recall.search import recall
+from nebula.recall.visibility import Viewer
 from nebula.store.db import open_database, resolve_db_path, schema_version
 from nebula.store.write_service import InvariantViolation, WriteService
+
+
+def _add_viewer_args(parser: argparse.ArgumentParser) -> None:
+    """读路径的身份参数（§10.6）。缺省即"无身份"：private 条目一律不可见。"""
+    parser.add_argument("--session", dest="session", default=None, help="私有分区身份")
+    parser.add_argument("--project", dest="project", default=None, help="项目作用域 id")
+    parser.add_argument("--host", dest="host", default=None, help="宿主名（host 作用域）")
+    parser.add_argument(
+        "--show-all",
+        dest="show_all",
+        action="store_true",
+        help="本机查看全部分区（仅 CLI；MCP 工具不提供这个开关）",
+    )
+
+
+def _viewer_of(args: argparse.Namespace) -> Viewer:
+    return Viewer(session_id=args.session, project_id=args.project, host=args.host)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -89,12 +107,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     explain_parser.add_argument("memory_id", help="记忆 id（形如 mem-12）")
     explain_parser.add_argument("--db", default=None)
-    explain_parser.add_argument("--session", dest="viewer_session", default=None)
+    _add_viewer_args(explain_parser)
     explain_parser.set_defaults(handler=_cmd_explain)
 
     expand_parser = subparsers.add_parser("expand", help="展开一条记忆的完整来历")
     expand_parser.add_argument("memory_id")
     expand_parser.add_argument("--db", default=None)
+    _add_viewer_args(expand_parser)
     expand_parser.set_defaults(handler=_cmd_expand)
 
     forget_parser = subparsers.add_parser("forget", help="遗忘（进回收站，30 天内可复原）")
@@ -228,7 +247,9 @@ def _cmd_recall(args: argparse.Namespace) -> int:
 def _cmd_explain(args: argparse.Namespace) -> int:
     conn = open_database(args.db)
     try:
-        result = explain(conn, args.memory_id, viewer_session=args.viewer_session)
+        result = explain(
+            conn, args.memory_id, viewer=_viewer_of(args), show_all=args.show_all
+        )
     finally:
         conn.close()
     for line in result.lines():
@@ -239,7 +260,9 @@ def _cmd_explain(args: argparse.Namespace) -> int:
 def _cmd_expand(args: argparse.Namespace) -> int:
     conn = open_database(args.db)
     try:
-        result = expand(conn, args.memory_id)
+        result = expand(
+            conn, args.memory_id, viewer=_viewer_of(args), show_all=args.show_all
+        )
     finally:
         conn.close()
     for line in result.lines():

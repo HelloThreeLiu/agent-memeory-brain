@@ -417,3 +417,96 @@ def test_sweep_status_rejects_targets_outside_the_whitelist(
         WriteService(conn).sweep_status([item.id], "active")
     assert memory_row(conn, item.id)["status"] == "active"
 
+
+def test_resolve_same_moment_uses_the_decision_time(
+    conn: sqlite3.Connection, service: WriteService
+) -> None:
+    """同刻对子裁 left：输家撑到裁决时刻，不是零宽区间（复查 m-9）。
+
+    §9.3 表第三行与实现曾经打架：`>=` 让同刻也走"赢家生效时刻"分支，
+    得到 `[t, t)` —— 不违反硬约束，但把"对子存续过、被注入过"的记录抹掉了。
+    """
+    keeper = service.remember(
+        "部署用 docker",
+        fact_key="deploy.same",
+        assertion_type="decision",
+        role="user",
+        evidence=("ep-1",),
+        now=at(0),
+    )
+    challenger = service.remember(
+        "部署改用 podman",
+        fact_key="deploy.same",
+        assertion_type="observation",
+        role="agent",
+        evidence=("ep-2",),
+        now=at(0),
+    )
+    assert challenger.arbitration_id is not None
+
+    service.resolve_arbitration(challenger.arbitration_id, "left", now=at(2))
+
+    loser = memory_row(conn, challenger.id)
+    assert loser["valid_from"] == fmt(at(0))
+    assert loser["valid_to"] == fmt(at(2))
+    assert parse_ts(loser["valid_to"]) > parse_ts(loser["valid_from"])
+    assert memory_row(conn, keeper.id)["status"] == "active"
+
+
+class _RestoreAfterScan:
+    """第一次读到回收站候选之后，立刻把它复原。
+
+    真实并发在 ``BEGIN IMMEDIATE`` 之后插不进来（写锁在事务手里），所以这里
+    在同一个连接、同一个事务里注入——测的是"扫描结果不能直接当成删除目标"
+    这条规则本身，而不是某种调度时序。
+    """
+
+    def __init__(self, real: sqlite3.Connection, memory_id: str) -> None:
+        self._real = real
+        self._memory_id = memory_id
+        self.injected = False
+
+    @property
+    def in_transaction(self) -> bool:
+        return self._real.in_transaction
+
+    def execute(self, sql: str, *args: object) -> sqlite3.Cursor:
+        cursor = self._real.execute(sql, *args)
+        if (
+            not self.injected
+            and sql.strip().startswith("SELECT id FROM memories")
+            and "deleted_at IS NOT NULL" in sql
+        ):
+            self.injected = True
+            WriteService(self._real).restore(self._memory_id, now=at(1))
+        return cursor
+
+
+def test_purge_skips_rows_restored_after_the_scan(
+    conn: sqlite3.Connection, write: Callable[..., WriteResult]
+) -> None:
+    """扫描之后被复原的条目，主体、索引、链接都不能动（复查 m-10）。
+
+    少一道"二次确认"，按旧 id 清 links / FTS 会留下"记忆还在、却搜不到也
+    没有关联"的不一致——比多留一条更糟。
+    """
+    target = write("三十天前忘掉的", now=at(0))
+    other = write("还活着的关联条目", now=at(0))
+    conn.execute(
+        "INSERT INTO memory_links (src, dst, type) VALUES (?, ?, 'supports')",
+        (other.id, target.id),
+    )
+    WriteService(conn).forget(target.id, now=at(0))
+    assert fts_rows(conn, target.id) == 0
+
+    probe = _RestoreAfterScan(conn, target.id)
+    purged = WriteService(probe).purge_expired(now=at(31))  # type: ignore[arg-type]
+
+    assert probe.injected is True, "注入没生效，这条用例什么都没测到"
+    assert purged == 0
+    row = memory_row(conn, target.id)
+    assert row["status"] == "active"
+    assert row["deleted_at"] is None
+    assert fts_rows(conn, target.id) == 1, "复原后的条目必须重新可搜"
+    assert conn.execute("SELECT COUNT(*) FROM memory_links").fetchone()[0] == 1
+

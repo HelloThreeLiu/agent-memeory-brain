@@ -507,38 +507,54 @@ class WriteService:
                 (cutoff,),
             ).fetchall()
             if rows:
-                ids = [str(row["id"]) for row in rows]
-                encoded = json.dumps(ids, ensure_ascii=False)
-                self._conn.execute(
-                    "DELETE FROM memory_links WHERE src IN (SELECT value FROM json_each(?)) "
-                    "OR dst IN (SELECT value FROM json_each(?))",
-                    (encoded, encoded),
-                )
-                self._conn.execute(
-                    "DELETE FROM arbitration WHERE left_id IN (SELECT value FROM json_each(?)) "
-                    "OR right_id IN (SELECT value FROM json_each(?))",
-                    (encoded, encoded),
-                )
-                self._conn.execute(
-                    "DELETE FROM memories_fts "
-                    "WHERE memory_id IN (SELECT value FROM json_each(?))",
-                    (encoded,),
-                )
-                self._conn.execute(
-                    "DELETE FROM memories WHERE id IN (SELECT value FROM json_each(?)) "
+                scanned = [str(row["id"]) for row in rows]
+                encoded = json.dumps(scanned, ensure_ascii=False)
+                # 二次确认（P1 复查 m-10）：扫描到删除之间状态仍可能被改——
+                # 只按"此刻仍是超期 deleted"的 id 去清 links / FTS / 主体。
+                # 少这一道，一条刚被复原的记忆会被删掉索引与链接、留下主体，
+                # 那是比多留一条更糟的不一致（主体删不掉，但已经搜不到了）。
+                confirmed = self._conn.execute(
+                    "SELECT id FROM memories "
+                    "WHERE id IN (SELECT value FROM json_each(?)) "
                     "AND status = 'deleted' AND deleted_at IS NOT NULL AND deleted_at <= ?",
                     (encoded, cutoff),
-                )
-                self._log_event(
-                    self._current_seq(),
-                    stamp,
-                    host,
-                    session_id,
-                    "memory.purged",
-                    None,
-                    {"count": len(ids)},
-                )
-                purged = len(ids)
+                ).fetchall()
+                if confirmed:
+                    doomed = json.dumps(
+                        [str(row["id"]) for row in confirmed], ensure_ascii=False
+                    )
+                    self._conn.execute(
+                        "DELETE FROM memory_links "
+                        "WHERE src IN (SELECT value FROM json_each(?)) "
+                        "OR dst IN (SELECT value FROM json_each(?))",
+                        (doomed, doomed),
+                    )
+                    self._conn.execute(
+                        "DELETE FROM arbitration "
+                        "WHERE left_id IN (SELECT value FROM json_each(?)) "
+                        "OR right_id IN (SELECT value FROM json_each(?))",
+                        (doomed, doomed),
+                    )
+                    self._conn.execute(
+                        "DELETE FROM memories_fts "
+                        "WHERE memory_id IN (SELECT value FROM json_each(?))",
+                        (doomed,),
+                    )
+                    self._conn.execute(
+                        "DELETE FROM memories WHERE id IN (SELECT value FROM json_each(?)) "
+                        "AND status = 'deleted' AND deleted_at IS NOT NULL AND deleted_at <= ?",
+                        (doomed, cutoff),
+                    )
+                    self._log_event(
+                        self._current_seq(),
+                        stamp,
+                        host,
+                        session_id,
+                        "memory.purged",
+                        None,
+                        {"count": len(confirmed)},
+                    )
+                    purged = len(confirmed)
         return purged
 
     def resolve_arbitration(
@@ -1385,14 +1401,15 @@ def _retire_boundary(winner_from: object, loser_from: object, stamp: str) -> str
     - 赢家更晚生效（新压旧）→ 在赢家生效处让位
     - 赢家更早生效（旧条胜出）→ 撑到被裁决为止：输家从自己生效到裁决之间
       **确实被注入过**，"它错了"由 superseded_by / refuted 承载，不由负区间承载
-    - 时间缺失或异常 → 裁决时刻，再兜一层不早于输家自己的生效时刻
+    - 同一时刻（或时间缺失、异常）→ 裁决时刻：同刻对子同样存续过，零宽区间
+      会把这段记录抹掉（P1 复查 m-9，`>` 而不是 `>=`）
     """
     started = parse_ts(None if loser_from is None else str(loser_from))
     upstream = parse_ts(None if winner_from is None else str(winner_from))
     decided = parse_ts(stamp)
     boundary: datetime | None
 
-    if upstream is not None and started is not None and upstream >= started:
+    if upstream is not None and started is not None and upstream > started:
         boundary = upstream
     else:
         boundary = decided if decided is not None else started

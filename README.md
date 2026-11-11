@@ -2,7 +2,7 @@
 
 > 给 AI 助手一套**能追溯、能回滚、能看见**的记忆。本地优先，零模型也能跑。
 
-**状态：P0 骨架可用（v0.0.1）。** 设计文档经过三轮独立评审，25 条意见全部处理；P0 已落地 schema、不变量断言、中文两因子召回与 CLI。还没有宿主接入（P1.5 起），`explain` / `forget` 等治理能力在 P1。
+**状态：P1 生命周期可用（v0.0.2）。** 设计文档经过三轮独立评审，25 条意见全部处理。P0 落地了 schema、不变量断言、中文两因子召回与 CLI；P1 补上衰减/休眠/归档/回收站、`explain` / `expand` / `forget` / `restore` / `pin` / `sleep`，以及仲裁终态。还没有宿主接入（P1.5 起）。
 
 ---
 
@@ -89,8 +89,16 @@ python -m nebula init                      # 建库、建 FTS 索引（默认 ~/
 python -m nebula remember "接口统一用 POST" --key api.method
 python -m nebula remember "构建命令是 npm run build" --key build.cmd
 python -m nebula recall "接口用什么方法"     # 打印注入格式，--json 给机器读
-python -m nebula status                    # 库的规模与状态
+python -m nebula explain mem-1             # 为什么召得到 / 召不到（四道闸逐条过）
+python -m nebula expand mem-1              # 历代版本、链接、仲裁、审计事件
+python -m nebula forget mem-1              # 进回收站，30 天内可 restore
+python -m nebula pin mem-1                 # 置顶，免于自动归档
+python -m nebula sleep --dry-run           # 只看这一轮维护会动哪些，不写库
+python -m nebula sleep                     # 衰减 / 休眠 / 归档 / 清回收站
+python -m nebula status                    # 库的规模、待维护量、回收站与置顶
 ```
+
+遗忘阶梯：`active --30 天未召回且 heat<0.25--> dormant --180 天且最冷 10%--> archived -->`（用户 `forget`）`deleted --30 天--> 物理删`。置顶条目全程豁免；归档、删除都退出 FTS 索引，复原时重新装回。
 
 零运行时依赖、断网可用、不需要任何 API key。库路径优先级：`--db` > `NEBULA_DB` > `~/.nebula/memory.db`。
 
@@ -101,7 +109,7 @@ python -m nebula status                    # 库的规模与状态
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | P0 | schema + 不变量断言 + 两因子召回 + CLI | 已完成（v0.0.1） |
-| P1 | 晋升 / 失效 / 归档 / 睡眠周期 / `explain` | 未开始 |
+| P1 | 衰减 / 休眠 / 归档 / 回收站 / 仲裁终态 / `explain` | 已完成（v0.0.2） |
 | P1.5 | 单宿主接入，攒真实召回日志（校准阈值的唯一机会） | 未开始 |
 | P2 | 星图 v1：快照 + 宇宙视图 + 时间回放 | 未开始 |
 | P3 | 星图 v2：神经视图 + 反向治理 | 未开始 |
@@ -129,9 +137,10 @@ agent-memeory-brain/
 ├── nebula/          引擎
 │   ├── core/        纯逻辑：路由、打分、分词、时间（无 I/O，可穷举单测）
 │   ├── store/       schema、迁移、write_service（唯一写入口）
-│   ├── recall/      候选池谓词 + FTS5 + 一席制
+│   ├── recall/      候选池谓词 + FTS5 + 一席制 + expand / explain
+│   ├── lifecycle/   衰减策略与睡眠维护（写仍然只经 write_service）
 │   └── __main__.py  CLI
-└── tests/           不变量断言与检索回归
+└── tests/           不变量断言、检索回归、500 轮膨胀测试
 ```
 
 ## 参与开发

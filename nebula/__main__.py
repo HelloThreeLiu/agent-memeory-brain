@@ -17,8 +17,13 @@ import json
 import sqlite3
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 
 from nebula import __version__
+from nebula.adapter.pointer import install as install_pointer
+from nebula.adapter.pointer import render_block
+from nebula.adapter.pointer import uninstall as remove_pointer
+from nebula.adapter.project import resolve as project_resolve
 from nebula.core.timeutil import now_ts
 from nebula.lifecycle.decay import plan as lifecycle_plan
 from nebula.lifecycle.sleep import run_sleep
@@ -141,6 +146,28 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser = subparsers.add_parser("status", help="看库的规模与状态")
     status_parser.add_argument("--db", default=None)
     status_parser.set_defaults(handler=_cmd_status)
+
+    pointer_parser = subparsers.add_parser(
+        "pointer", help="指令文件里的记忆指针块（B 档接入）"
+    )
+    pointer_sub = pointer_parser.add_subparsers(dest="pointer_action", required=True)
+    pointer_show = pointer_sub.add_parser("show", help="打印指针块内容")
+    pointer_show.set_defaults(handler=_cmd_pointer_show)
+    pointer_install = pointer_sub.add_parser("install", help="写入或更新指针块（幂等）")
+    pointer_install.add_argument(
+        "--file",
+        required=True,
+        help="目标指令文件，如 ./CLAUDE.md 或 ./AGENTS.md；必填，避免写错位置",
+    )
+    pointer_install.set_defaults(handler=_cmd_pointer_install)
+    pointer_uninstall = pointer_sub.add_parser("uninstall", help="移除指针块")
+    pointer_uninstall.add_argument("--file", required=True)
+    pointer_uninstall.set_defaults(handler=_cmd_pointer_uninstall)
+
+    project_parser = subparsers.add_parser("project", help="看当前目录解析出的项目 id")
+    project_parser.add_argument("--path", default=None, help="起点目录（默认当前目录）")
+    project_parser.add_argument("--project", dest="explicit", default=None, help="显式指定 id")
+    project_parser.set_defaults(handler=_cmd_project)
 
     return parser
 
@@ -376,6 +403,45 @@ def _cmd_status(args: argparse.Namespace) -> int:
         print(f"回收站：{recycled} · 置顶：{pinned}")
     finally:
         conn.close()
+    return 0
+
+
+def _cmd_pointer_show(args: argparse.Namespace) -> int:
+    print(render_block())
+    return 0
+
+
+def _cmd_pointer_install(args: argparse.Namespace) -> int:
+    target = Path(args.file)
+    action = install_pointer(target)
+    labels = {
+        "created": "已新建并写入",
+        "appended": "已追加到文件末尾",
+        "updated": "已更新既有指针块",
+        "unchanged": "已是最新，未改动",
+    }
+    print(f"{labels.get(action, action)}：{target}")
+    if action in ("created", "appended"):
+        print("提示：这是说明书，不是存储——记忆本身仍在 Nebula 库里。")
+    return 0
+
+
+def _cmd_pointer_uninstall(args: argparse.Namespace) -> int:
+    target = Path(args.file)
+    if not remove_pointer(target):
+        print(f"{target} 里没有 nebula 指针块")
+        return 0
+    print(f"已移除指针块：{target}")
+    return 0
+
+
+def _cmd_project(args: argparse.Namespace) -> int:
+    ref = project_resolve(args.path, explicit=args.explicit)
+    print(f"project_id：{ref.project_id}")
+    print(f"来源：{ref.source}" + ("（非 git 目录：换路径就会失忆）" if ref.is_loose else ""))
+    print(f"根目录：{ref.root}")
+    if ref.name:
+        print(f"名字：{ref.name}")
     return 0
 
 

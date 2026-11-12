@@ -30,6 +30,7 @@ from nebula.core.assertion import role_from_asserted_by
 from nebula.core.conflict import FactView
 from nebula.core.timeutil import fmt, now_ts, parse_ts
 from nebula.core.tokenize import index_text
+from nebula.core.viewer import Viewer, deny_reason
 
 #: 幂等窗口：同键同内容在此窗口内合并，不新建（§9.1）
 DEDUP_WINDOW_SECONDS = 60
@@ -235,6 +236,10 @@ class WriteService:
             raise ValueError("scope=global 时不能带 project_id")
         if scope == "project" and project_id is None:
             raise ValueError("scope=project 时必须带 project_id")
+        if scope == "host" and not host:
+            # 没有 host 的 host 作用域条目对任何视图都不可见（含它自己的宿主），
+            # 写进去就再也召不回来——与 private 缺 session 是同一类静默失败
+            raise ValueError("scope=host 时必须带 host：否则这条记忆对任何宿主都不可见")
         if visibility == "private" and not session_id:
             raise ValueError(
                 "visibility=private 必须带 session_id：否则这条记忆对谁都不在候选集里，"
@@ -425,12 +430,17 @@ class WriteService:
         injection_id: str | None = None,
         host: str | None = None,
         session_id: str | None = None,
+        viewer: Viewer | None = None,
         now: datetime | None = None,
     ) -> FeedbackResult:
         """记一条反馈（§16.2 的唯一数据源），同时落一条审计事件。
 
         **对不存在的 id 抛错，不静默接受**：模型代调工具时最容易把 id 记错一个字符，
         静默吞掉会让"负反馈率"看起来永远是 0——那比没有指标更糟。
+
+        **给了 ``viewer`` 就校验可见性**（审查 m-3）：能看见是写入反馈的前提，
+        否则用户可以对他人的私有片段写 `note`（可能含私密吐槽）并挂到那条上。
+        不可见与不存在**用同一句报错**——分开报等于给出一个 id 存在性预言机。
 
         **本批不改 confidence**：设计文档 §9.5 只定义了"删 L3 → 依赖它的 L4 降权"，
         没有定义"负反馈降权"。降多少要等 b 段攒出的基线，现在拍一个数字就是猜。
@@ -446,10 +456,14 @@ class WriteService:
 
         with self.transaction():
             row = self._conn.execute(
-                "SELECT id, seq, scope, visibility FROM memories WHERE id = ?",
+                "SELECT id, seq, scope, project_id, host, session_id, visibility "
+                "FROM memories WHERE id = ?",
                 (memory_id,),
             ).fetchone()
             if row is None:
+                raise ValueError(f"没有这条记忆：{memory_id}（反馈必须指向真实存在的条目）")
+            if viewer is not None and deny_reason(row, viewer) is not None:
+                # 与"不存在"同一句话：不可见也是"查无此条"，不给出存在性信号
                 raise ValueError(f"没有这条记忆：{memory_id}（反馈必须指向真实存在的条目）")
             if injection_id is not None:
                 exists = self._conn.execute(

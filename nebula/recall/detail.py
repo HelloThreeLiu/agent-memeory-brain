@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from nebula.core.assertion import role_from_asserted_by
-from nebula.recall.visibility import (
+from nebula.core.viewer import (
     MemoryNotVisible,
     Viewer,
     deny_reason,

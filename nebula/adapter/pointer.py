@@ -44,7 +44,12 @@ def render_block() -> str:
 
 
 def _read(path: Path) -> tuple[str, str]:
-    """返回 (规范化成 \\n 的文本, 原换行符)。文件不存在时给空文本 + \\n。"""
+    """返回 (规范化成 \\n 的文本, 原换行符)。文件不存在时给空文本 + \\n。
+
+    已知限制（审查 n-6）：**混合换行**（部分 CRLF 部分 LF）的文件在真正改写时会被
+    统一成多数的那种换行——指针块之外的字节也跟着变。只有确实要改块时才写回；
+    ``install`` 判定 ``unchanged`` 时不碰文件，所以日常重复安装不会触发。
+    """
     if not path.is_file():
         return "", "\n"
     with open(path, encoding="utf-8", newline="") as handle:
@@ -58,11 +63,6 @@ def _write(path: Path, text: str, newline: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="") as handle:
         handle.write(payload)
-
-
-def has_block(path: Path) -> bool:
-    text, _ = _read(path)
-    return BEGIN in text and END in text
 
 
 def install(path: Path) -> str:

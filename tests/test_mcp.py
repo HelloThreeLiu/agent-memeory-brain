@@ -324,3 +324,66 @@ def test_database_is_created_and_migrated(tmp_path: Path, client: _Client) -> No
         assert conn.execute("SELECT COUNT(*) FROM injection_log").fetchone()[0] == 0
     finally:
         conn.close()
+
+
+def test_feedback_on_invisible_memory_looks_exactly_like_missing(
+    conn: sqlite3.Connection,
+) -> None:
+    """审查 m-3：不可见也不能写反馈，且不能报出"这条存在"。
+
+    两条路径的措辞除 id 外必须逐字一致——否则模型可以靠错误文本枚举出
+    "库里有没有 mem-7" 这件事。
+    """
+    owner = Server(ToolContext(conn=conn, host="h", session_id="s-1", project_id="p-1"))
+    _call(
+        owner,
+        70,
+        "tools/call",
+        {"name": "remember", "arguments": {"content": SECRET, "visibility": "private"}},
+    )
+
+    stranger = Server(ToolContext(conn=conn, host="h", session_id="s-2", project_id="p-1"))
+    invisible = _call(
+        stranger,
+        71,
+        "tools/call",
+        {
+            "name": "feedback",
+            "arguments": {"id": "mem-1", "kind": "wrong", "note": "私密吐槽：端口抄错了"},
+        },
+    )
+    missing = _call(
+        stranger,
+        72,
+        "tools/call",
+        {"name": "feedback", "arguments": {"id": "mem-404", "kind": "wrong"}},
+    )
+
+    assert invisible["result"]["isError"] is True
+    assert missing["result"]["isError"] is True
+    assert invisible["result"]["content"][0]["text"].replace(
+        "mem-1", "ID"
+    ) == missing["result"]["content"][0]["text"].replace("mem-404", "ID")
+
+    # 一行都不能落：note 里可能有私密内容
+    assert conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0] == 0
+    assert (
+        conn.execute("SELECT COUNT(*) FROM events WHERE type = 'feedback.recorded'").fetchone()[0]
+        == 0
+    )
+
+
+def test_owner_can_still_give_feedback_on_own_private_memory(
+    conn: sqlite3.Connection,
+) -> None:
+    owner = Server(ToolContext(conn=conn, host="h", session_id="s-1", project_id="p-1"))
+    _call(
+        owner,
+        73,
+        "tools/call",
+        {"name": "remember", "arguments": {"content": SECRET, "visibility": "private"}},
+    )
+    response = _call(
+        owner, 74, "tools/call", {"name": "feedback", "arguments": {"id": "mem-1", "kind": "wrong"}}
+    )
+    assert "已记录反馈" in response["result"]["content"][0]["text"]

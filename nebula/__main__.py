@@ -25,12 +25,12 @@ from nebula.adapter.pointer import render_block
 from nebula.adapter.pointer import uninstall as remove_pointer
 from nebula.adapter.project import resolve as project_resolve
 from nebula.core.timeutil import now_ts
+from nebula.core.viewer import Viewer
 from nebula.lifecycle.decay import plan as lifecycle_plan
 from nebula.lifecycle.sleep import run_sleep
 from nebula.recall.detail import expand
 from nebula.recall.explain import explain
 from nebula.recall.search import recall
-from nebula.recall.visibility import Viewer
 from nebula.store.db import open_database, resolve_db_path, schema_version
 from nebula.store.write_service import InvariantViolation, WriteService
 
@@ -82,6 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     remember_parser.add_argument("--role", default="user", help="写入方角色（默认 user）")
     remember_parser.add_argument("--scope", default="global", choices=["global", "project", "host"])
+    remember_parser.add_argument("--host", default=None, help="宿主名（scope=host 时必填）")
     remember_parser.add_argument("--project", dest="project_id", default=None)
     remember_parser.add_argument("--importance", type=float, default=0.5)
     remember_parser.add_argument("--valid-from", dest="valid_from", default=None)
@@ -98,6 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
     recall_parser.add_argument("--scope", default=None, choices=["global", "project", "host"])
     recall_parser.add_argument("--project", dest="project_id", default=None)
     recall_parser.add_argument("--session", dest="viewer_session", default=None)
+    recall_parser.add_argument("--host", default=None, help="调用方宿主名（决定 host 分区可见性）")
     recall_parser.add_argument("--json", action="store_true", help="输出 JSON")
     recall_parser.add_argument(
         "--no-record",
@@ -193,6 +195,7 @@ def _cmd_remember(args: argparse.Namespace) -> int:
             args.content,
             scope=args.scope,
             project_id=args.project_id,
+            host=args.host,
             kind=args.kind,
             assertion_type=args.assertion_type,
             role=args.role,
@@ -235,6 +238,7 @@ def _cmd_recall(args: argparse.Namespace) -> int:
             scope=args.scope,
             project_id=args.project_id,
             viewer_session=args.viewer_session,
+            viewer_host=args.host,
             record=args.record,
         )
     finally:

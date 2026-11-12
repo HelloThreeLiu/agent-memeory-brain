@@ -233,7 +233,7 @@ def test_explain_reports_private_partition(
     item = write("私有片段：端口 9222", visibility="private", session_id="s-1")
     blocked = explain(conn, item.id)
     assert blocked.recallable is False
-    assert any("私有分区" in reason for reason in blocked.reasons)
+    assert any("visibility 不匹配" in reason for reason in blocked.reasons)
 
     visible = explain(conn, item.id, viewer_session="s-1")
     assert visible.recallable is True

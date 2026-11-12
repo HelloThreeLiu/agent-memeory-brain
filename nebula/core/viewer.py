@@ -1,16 +1,20 @@
-"""读路径的可见性口径（§10.6）。
+"""可见性口径（§10.6）：读路径与写侧共用的一条规则。
 
-一句话：**读路径与召回同一条谓词**。召回早就按 ``visibility`` / ``scope`` 过滤候选池，
-而 ``expand`` / ``explain`` 在 P1 之前是本地 CLI 工具、调用方就是库的主人，所以没过滤。
-P1.5 把它们交给 agent 调之后，这个前提消失——凭一个 id 就能读到别的 session 的私有片段。
+一句话：**能召回的东西，和能展开的东西，是同一个集合。**
+
+放在 ``core`` 而不是 ``recall``，是因为写侧也要用它（``record_feedback`` 不该允许
+对看不见的条目写反馈），而 ``store`` 反向依赖 ``recall`` 是坏方向。这里只有判定与
+SQL 片段，没有业务 I/O。
 
 三条落地约定：
 
-1. **默认拒绝**：不传 ``Viewer`` 等于"没有身份"，此时 ``private`` 条目一律不可见。
-   忘了传的失败模式必须是"看不到"，不能是"全泄漏"。
-2. **不可见要说出来**：抛 :class:`MemoryNotVisible`，由调用方转成一句人话。
-   静默返回空结构会让人以为这条不存在，那是记忆系统最不该犯的错。
-3. **连带数据同口径**：历代版本、关联边、审计事件都过同一个函数，不另立规则。
+1. **默认拒绝**：不传 ``Viewer`` 等于"没有身份"，``private`` 与 ``project`` / ``host``
+   一律不可见。忘了传的失败模式必须是"看不到"，不能是"全泄漏"。
+2. **两处实现必须同结果**：:func:`deny_reason` 是 Python 判定，:func:`scope_predicate`
+   与 :func:`visibility_predicate` 是 SQL 片段。候选池走 SQL（性能），读单条走
+   Python；两者由 ``tests/test_visibility.py`` 的一致性用例钉住，分叉即变红。
+3. **不可见时说"不可见"，但不报别人的身份**：原因里只出现维度名，不出现对方的
+   session id / project hash / host 名——那些本身也是信息。
 """
 
 from __future__ import annotations
@@ -57,17 +61,14 @@ def deny_reason(row: _RowLike, viewer: Viewer) -> str | None:
 
     顺序是**先可见性、后作用域**：私有分区的约束比作用域更强，先判它能保证
     private 条目即便落在 global 也不会因为作用域放行而漏出去。
+
+    措辞里只有维度名，没有对方的标识（审查 m-2）：把 owner 的 session id 回给
+    调用方，等于用一个"看不见"的消息告诉他"存在一个属于 s-3 的东西"。
     """
-    visibility = _text(row["visibility"])
-    if visibility == "private":
+    if _text(row["visibility"]) == "private":
         owner = _text(row["session_id"])
         if viewer.session_id is None or owner != viewer.session_id:
-            caller = (
-                f"当前调用方是 {viewer.session_id}"
-                if viewer.session_id
-                else "当前调用方没有 session 身份"
-            )
-            return f"私有分区：只对 session={owner} 可见，{caller}"
+            return "visibility 不匹配（private 分区：只对写入方会话可见）"
 
     scope = _text(row["scope"])
     if scope == "global":
@@ -75,19 +76,19 @@ def deny_reason(row: _RowLike, viewer: Viewer) -> str | None:
     if scope == "project":
         if viewer.project_id is not None and _text(row["project_id"]) == viewer.project_id:
             return None
-        return f"属于另一个项目（project={_text(row['project_id'])}），当前调用方没有该项目的上下文"
+        return "scope 不匹配（属于另一个项目）"
     if scope == "host":
         if viewer.host is not None and _text(row["host"]) == viewer.host:
             return None
-        return f"属于另一个宿主（host={_text(row['host'])}）"
+        return "scope 不匹配（属于另一个宿主）"
     return f"未知的 scope：{scope!r}"
 
 
 def event_deny_reason(row: _RowLike, viewer: Viewer) -> str | None:
     """审计事件用同一口径；缺分区列的历史行按"归属未知"处理，不返回。
 
-    events 的列名与 memories 不同（``session`` 而非 ``session_id``，v4 才补上
-    ``project_id``），所以单独一个函数，但规则逐条对应 :func:`deny_reason`。
+    events 的列名与 memories 不同（``session`` 而非 ``session_id``），所以单独一个
+    函数，但规则逐条对应 :func:`deny_reason`。
     """
     scope = _text(row["scope"])
     visibility = _text(row["visibility"])
@@ -97,24 +98,49 @@ def event_deny_reason(row: _RowLike, viewer: Viewer) -> str | None:
     if visibility == "private":
         owner = _text(row["session"])
         if viewer.session_id is None or owner != viewer.session_id:
-            return "事件属于他人的私有分区"
+            return "visibility 不匹配（事件属于他人的私有分区）"
 
     if scope == "global":
         return None
     if scope == "project":
         if viewer.project_id is not None and _text(row["project_id"]) == viewer.project_id:
             return None
-        return "事件属于另一个项目"
+        return "scope 不匹配（事件属于另一个项目）"
     if scope == "host":
         if viewer.host is not None and _text(row["host"]) == viewer.host:
             return None
-        return "事件属于另一个宿主"
+        return "scope 不匹配（事件属于另一个宿主）"
     return f"事件的分区未知：{scope!r}"
 
 
-def visible_ids(
-    conn: sqlite3.Connection, ids: tuple[str, ...], viewer: Viewer
-) -> set[str]:
+def visibility_predicate(viewer: Viewer) -> tuple[str, tuple[object, ...]]:
+    """``visibility`` 维度的 SQL 片段（对应 :func:`deny_reason` 的第一段）。
+
+    ``session_id = NULL`` 在 SQL 里既不真也不假，所以 private 行对没有身份的
+    调用方自然不命中——与 Python 侧的 ``owner != viewer.session_id`` 同义。
+    """
+    return "(visibility = 'shared' OR session_id = ?)", (viewer.session_id,)
+
+
+def scope_predicate(viewer: Viewer) -> tuple[str, tuple[object, ...]]:
+    """``scope`` 维度的 SQL 片段。
+
+    **缺 project 或 host 时对应的分区整段不出现**，这正是 §10.6 的"没给 project
+    → 只看得到 global"。P1.5a 初版写成了"project_id 为 None 就不加任何 scope
+    条件"，等于把 loose 视图放大成全库视图（审查 C-1）。
+    """
+    clauses = ["scope = 'global'"]
+    params: list[object] = []
+    if viewer.project_id is not None:
+        clauses.append("(scope = 'project' AND project_id = ?)")
+        params.append(viewer.project_id)
+    if viewer.host is not None:
+        clauses.append("(scope = 'host' AND host = ?)")
+        params.append(viewer.host)
+    return "(" + " OR ".join(clauses) + ")", tuple(params)
+
+
+def visible_ids(conn: sqlite3.Connection, ids: tuple[str, ...], viewer: Viewer) -> set[str]:
     """批量筛出可见的 id（关联边与历史版本用）。
 
     一次 ``IN`` 查询，不逐条命中数据库：expand 的输出里关联边可能几十条，

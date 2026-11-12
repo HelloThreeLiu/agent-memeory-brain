@@ -19,8 +19,8 @@ from datetime import datetime
 
 from nebula.core.assertion import rank as assertion_rank
 from nebula.core.timeutil import now_ts, parse_ts
+from nebula.core.viewer import Viewer, deny_reason
 from nebula.recall.detail import ExpandResult, MemoryDetail, expand
-from nebula.recall.visibility import Viewer, deny_reason
 
 
 @dataclass(frozen=True)

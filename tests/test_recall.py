@@ -99,7 +99,11 @@ def test_expired_row_without_fact_key_is_excluded(
 def test_seat_is_scoped_by_project(
     conn: sqlite3.Connection, write: Callable[..., WriteResult]
 ) -> None:
-    """两个项目各有一条 build.cmd，读路径不能把它们合并成一席。"""
+    """两个项目各有一条 build.cmd，读路径不能把它们合并成一席。
+
+    P1.5a 起 §10.6 生效：不传 project 的调用方**看不见** project 分区（而不是
+    看见所有项目）。所以这里必须分别用两个项目视图查。
+    """
     write(
         "构建命令是 npm run build",
         assertion_type="decision",
@@ -116,12 +120,14 @@ def test_seat_is_scoped_by_project(
         project_id="p2",
         fact_key="build.cmd",
     )
-    result = recall(conn, "构建命令", 5)
-    assert len(result.hits) == 2
-    assert {hit.content for hit in result.hits} == {
-        "构建命令是 npm run build",
-        "构建命令是 make build",
-    }
+    assert [hit.content for hit in recall(conn, "构建命令", 5, project_id="p1").hits] == [
+        "构建命令是 npm run build"
+    ]
+    assert [hit.content for hit in recall(conn, "构建命令", 5, project_id="p2").hits] == [
+        "构建命令是 make build"
+    ]
+    # 没有项目上下文 → 两个项目都不可见，也不该因为"看不见"而挤成一席
+    assert recall(conn, "构建命令", 5).hits == ()
 
 
 def test_host_scope_is_not_in_project_view(
@@ -129,8 +135,17 @@ def test_host_scope_is_not_in_project_view(
 ) -> None:
     write("本机装了 jq 工具", scope="host", host="pc-1", fact_key="host.jq")
     write("构建用 make 命令", scope="project", project_id="p1", fact_key="proj.build")
+    # 只有项目上下文、没有宿主身份 → host 分区不可见（§10.6）
     assert recall(conn, "本机装了 jq", project_id="p1").hits == ()
     assert len(recall(conn, "构建用 make", project_id="p1").hits) == 1
+    # 同一宿主 + 同一项目 → 两个分区都该看得见（审查 M-1：host 写得到也要召得回）
+    hit_ids = {
+        hit.content
+        for hit in recall(conn, "本机装了 jq", project_id="p1", viewer_host="pc-1").hits
+    }
+    assert hit_ids == {"本机装了 jq 工具"}
+    # 别的宿主看不见
+    assert recall(conn, "本机装了 jq", project_id="p1", viewer_host="pc-2").hits == ()
 
 
 def test_third_challenger_does_not_open_a_third_seat(

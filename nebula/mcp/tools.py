@@ -8,7 +8,7 @@ B 档没有 hook 可以注入，全靠**工具描述驱动模型主动调用**�
 
 1. 所有写经 :class:`~nebula.store.write_service.WriteService`（INV1）——工具层不做 SQL 写；
 2. ``recall`` 每次落一条 ``injection_log``，这是三项指标的**分母**，不许跳过；
-3. ``expand`` 用 :class:`~nebula.recall.visibility.Viewer` 过滤，且**不暴露 show_all**
+3. ``expand`` 用 :class:`~nebula.core.viewer.Viewer` 过滤，且**不暴露 show_all**
    ——agent 不该有"看全部"的开关（§10.6）；
 4. ``feedback`` 自己回连最近一次注入，不靠模型传 id（模型抄 id 一定会抄错）。
 """
@@ -19,9 +19,9 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
+from nebula.core.viewer import Viewer
 from nebula.recall.detail import expand
 from nebula.recall.search import recall
-from nebula.recall.visibility import Viewer
 from nebula.store.write_service import FEEDBACK_KINDS, WriteService
 
 #: 工具返回给模型的注入块上限（字符）。recall 的 limit 之外再加一道硬闸：
@@ -214,6 +214,7 @@ def _recall(arguments: dict[str, Any], ctx: ToolContext) -> str:
         limit,
         project_id=ctx.effective_project_id,
         viewer_session=ctx.session_id,
+        viewer_host=ctx.host,
         record=True,
     )
     lines = list(result.lines())
@@ -258,6 +259,7 @@ def _feedback(arguments: dict[str, Any], ctx: ToolContext) -> str:
         injection_id=injection_id,
         host=ctx.host,
         session_id=ctx.session_id,
+        viewer=ctx.viewer,
     )
     linked = "，已关联到最近一次注入" if injection_id else ""
     return f"已记录反馈：{memory_id} ← {kind}（{result.id}{linked}）"
@@ -332,7 +334,10 @@ TOOLS: tuple[ToolSpec, ...] = (
                 "scope": {
                     "type": "string",
                     "enum": ["global", "project", "host"],
-                    "description": "global=跨项目，project=只对本项目（默认），host=只对本宿主",
+                    "description": (
+                        "global=跨项目，project=只对本项目（默认），"
+                        "host=只对本宿主（需服务以 --host 启动）"
+                    ),
                 },
                 "project_id": {"type": "string", "description": "默认用当前目录解析出的项目"},
                 "importance": {"type": "number", "minimum": 0, "maximum": 1},

@@ -74,6 +74,29 @@
 
 **b 段范围外清单**（明确不在本批做）：选宿主与写配置、指针块写进真实仓库、连续 5 天使用、`nebula report` 三项指标、阈值校准结论、负反馈是否降 `confidence`（要基线才能定降多少，现在拍数字就是猜）。
 
+## 审查记录（P1.5a，独立会话执行）
+
+原始报告 `.reviews/CODE-REVIEW-P1.5a-adapter-2026-11-11.md`（过程稿，不入库）。结论「修复后通过」，**C-1 / M-1 阻塞合并**。以下每条都有会红的用例或实跑输出。
+
+| 编号 | 级别 | 问题 | 处理 | 验证证据 |
+|---|---|---|---|---|
+| C-1 | **Critical** | `_fetch_pool` 在 `project_id` 为 None 时**不加任何 scope 条件**，loose 视图等于全库视图：别的项目的 `scope=project` 条目、所有宿主的 `scope=host` 条目都会被召回注入。而 `deny_reason` 判它们"不可见"——两套口径分叉，P1 审查 M-2 在 scope 轴重演 | 口径下沉到 `nebula/core/viewer.py`（`store` 不该反向依赖 `recall`）：新增 `visibility_predicate` / `scope_predicate` 两个 SQL 片段，与 `deny_reason` 逐条对应；`_fetch_pool` 用它们拼条件，返回前再用 `deny_reason` 复核（只能再删不能补回，失败方向是少召回而非泄漏） | 复现脚本实跑：loose 查项目A / 宿主X 均 `[]`（修复前分别是 `['mem-1']` / `['mem-2']`）；新增 `test_loose_recall_does_not_leak_other_partitions`；反例：SQL 谓词恒真 → 16 条红；旧 `_fetch_pool` 全量视图+无复核 → 20 条红 |
+| M-1 | **Major** | `scope=host` 写得到、召不回：项目视图谓词 `(scope='global' OR project_id=?)` 把 host 行（`project_id=NULL`）排除，recall 根本没有 host 维度 | 同一处修复加 host 分支；`recall` 新增 `viewer_host`，MCP/CLI 都传；`remember` 在写口要求 `scope=host` 必须带 `host` | `test_host_scope_is_not_in_project_view` 断言同宿主命中、异宿主不命中（修复前同宿主也是 `[]`）；实跑 myhost 条目在 `project_id=proj-B` 视图下由 `[]` → `['mem-3']`；反例：去掉 host 分支 → 4 条红 |
+| m-2 | Minor | `deny_reason` 的 reason 带 owner 的 session id / project hash / host 名，经 `expand`/`explain` 回给模型 | 措辞只留维度名："visibility 不匹配（private 分区…）" / "scope 不匹配（属于另一个项目/宿主）" | 三条断言：reason 不含 `s-1`、`p-1`、`claude-code` |
+| m-3 | Minor | `record_feedback` 不校验可见性，可对他人私有条目写 note；且"没有这条记忆"构成 id 存在性预言机 | `record_feedback` 新增 `viewer`，不可见与不存在**报同一句话**；MCP 传 `ctx.viewer` | `test_feedback_on_invisible_memory_looks_exactly_like_missing`：除 id 外措辞逐字一致，`feedback`/`events` 均为 0 行；`test_owner_can_still_give_feedback_on_own_private_memory` 保证没误杀 |
+| n-4 | Nit | `pointer.has_block` 无调用方（死代码） | 删除 | ruff 无未使用告警 |
+| n-5 | Nit | v4 两表用 `session`，`memories` 用 `session_id` | **不改**，与 `events` 对齐；记档待 P4 统一 | — |
+| n-6 | Nit | 混合换行文件在改写时会被统一成多数换行 | **记档**：`install` 判定 `unchanged` 时不碰文件，只有确实要改块时才重写全文；已写进 `_read` 的 docstring | — |
+
+**审查观察项**（不阻塞，登记备查）
+
+1. `injection_log` / `feedback` 无保留策略——等 b 段数据量出来再定清理规则。
+2. `_latest_injection` 不按 host/session 过滤，反馈可能挂到别的 session 的注入上——只影响指标归因，报告口径注意。
+3. 模型自报 `role="user"` 即可写 decision（INV6 靠工具描述约束，代码不拦）——B 档接受，P4 多 agent 接入前重估。
+4. `nebula.mcp` 从 spawn 时 cwd 推断项目——宿主以 home 为 cwd 启动时 git 项目会被判 loose；C-1 修复后读侧安全，写侧本来就退 global。
+
+**修复后复验（2026-11-12）**：`ruff` 0 / `mypy --strict` 0（29 文件）/ `pytest` **262 passed** / `python -m build` 出 `0.0.3` wheel。新增 35 条用例（30 格一致性参数化 + C-1 反例 + M-1 正例 + m-2/m-3 断言）。
+
 ## 原 P1 口子（Q-1..Q-9）的收口
 
 | ID | 处置 |

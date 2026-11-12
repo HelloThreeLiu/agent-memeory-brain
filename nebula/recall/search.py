@@ -21,6 +21,7 @@ from nebula.core.assertion import rank as assertion_rank
 from nebula.core.assertion import role_from_asserted_by
 from nebula.core.timeutil import now_ts, parse_ts
 from nebula.core.tokenize import query_tokens
+from nebula.core.viewer import Viewer, deny_reason, scope_predicate, visibility_predicate
 from nebula.lifecycle import policy
 from nebula.store.write_service import WriteService
 
@@ -90,18 +91,28 @@ def recall(
     scope: str | None = None,
     project_id: str | None = None,
     viewer_session: str | None = None,
+    viewer_host: str | None = None,
     now: str | None = None,
     record: bool = True,
 ) -> RecallResult:
     """按查询取 top-k。
 
-    ``viewer_session`` 决定 ``visibility=private`` 的条目能不能进候选集（INV7）：
-    私有片段只对同一 session 可见，不是取回来再过滤。
+    ``viewer_session`` / ``project_id`` / ``viewer_host`` 三者构成调用方身份，决定
+    候选池里**哪些分区**能进来（§10.6）：
+
+    - 没给 ``project_id`` → 只看得到 ``scope=global``（不是"看得到全部"，P1.5a
+      初版在这里写成无约束，等于把 loose 视图放大成全库视图）；
+    - 没给 ``viewer_host`` → 看不到 ``scope=host``；
+    - ``private`` 只对同一 session 可见（INV7）。
+
+    ``scope`` 是**收窄**而不是身份：它只在可见集合内部再筛一层（"我这次只想看
+    project 分区"），不会因为指定了它而让看不见的分区变得可见。
 
     ``record=True`` 时把命中的 ``last_recalled`` / ``recall_count`` 写回库
     （BACKLOG Q-8）——9.2 的晋升触发与 9.5 的衰减都靠它。写仍然经
     ``write_service``，读路径不自己 UPDATE（INV1）。只读场景传 ``False``。
     """
+    viewer = Viewer(session_id=viewer_session, project_id=project_id, host=viewer_host)
     started = time.perf_counter()
     tokens = query_tokens(query)
     stamp = now or now_ts()
@@ -130,14 +141,7 @@ def recall(
         rank_by_id[memory_id] = float(row["rank"])
         tokens_by_id[memory_id] = set(str(row["content_2gram"]).split())
 
-    rows = _fetch_pool(
-        conn,
-        tuple(rank_by_id),
-        stamp=stamp,
-        scope=scope,
-        project_id=project_id,
-        viewer_session=viewer_session,
-    )
+    rows = _fetch_pool(conn, tuple(rank_by_id), stamp=stamp, scope=scope, viewer=viewer)
 
     candidates: list[_Candidate] = []
     for row in rows:
@@ -243,32 +247,46 @@ def _fetch_pool(
     *,
     stamp: str,
     scope: str | None,
-    project_id: str | None,
-    viewer_session: str | None,
+    viewer: Viewer,
 ) -> list[sqlite3.Row]:
+    """候选池谓词：状态 / 时间窗 / 分区，一次查完。
+
+    分区条件由 :func:`visibility_predicate` 与 :func:`scope_predicate` 生成，
+    与 :func:`deny_reason` 逐条对应；返回前再用 ``deny_reason`` 复核一遍。
+    复核只能"再删"不能"补回"，所以两处一旦分叉表现为**少召回**而不是泄漏——
+    这是有意的失败方向，分叉本身由一致性用例抓。
+    """
     placeholders = ",".join("?" for _ in ids)
     conditions = [
         "status IN ('active', 'dormant')",
         "(valid_from IS NULL OR valid_from <= ?)",
         "(valid_to IS NULL OR valid_to > ?)",
-        "(visibility = 'shared' OR session_id = ?)",
-        f"id IN ({placeholders})",
     ]
-    params: list[object] = [stamp, stamp, viewer_session, *ids]
+    params: list[object] = [stamp, stamp]
+
+    visibility_sql, visibility_params = visibility_predicate(viewer)
+    conditions.append(visibility_sql)
+    params.extend(visibility_params)
+
+    scope_sql, scope_params = scope_predicate(viewer)
+    conditions.append(scope_sql)
+    params.extend(scope_params)
+
     if scope is not None:
+        # 收窄不等于提权：它只会把可见集合再筛小
         conditions.append("scope = ?")
         params.append(scope)
-    if project_id is not None:
-        # 项目视图 = 该项目的条目 + 全局条目；scope=host 的条目不属于任何项目
-        conditions.append("(scope = 'global' OR project_id = ?)")
-        params.append(project_id)
+
+    conditions.append(f"id IN ({placeholders})")
+    params.extend(ids)
+
     sql = (
         "SELECT id, content, assertion_type, asserted_by, fact_key, layer, importance, "
-        "weight, confidence, pinned, seq, scope, project_id FROM memories WHERE "
-        + " AND ".join(conditions)
+        "weight, confidence, pinned, seq, scope, project_id, session_id, host, visibility "
+        "FROM memories WHERE " + " AND ".join(conditions)
     )
     rows: list[sqlite3.Row] = conn.execute(sql, params).fetchall()
-    return rows
+    return [row for row in rows if deny_reason(row, viewer) is None]
 
 
 def _open_pairs(conn: sqlite3.Connection, ids: tuple[str, ...]) -> set[frozenset[str]]:

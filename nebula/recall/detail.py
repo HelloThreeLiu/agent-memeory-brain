@@ -15,6 +15,13 @@ from dataclasses import dataclass
 from typing import Any
 
 from nebula.core.assertion import role_from_asserted_by
+from nebula.core.viewer import (
+    MemoryNotVisible,
+    Viewer,
+    deny_reason,
+    event_deny_reason,
+    visible_ids,
+)
 
 
 def _json_list(raw: str | None) -> tuple[str, ...]:
@@ -143,6 +150,9 @@ class ExpandResult:
     links: tuple[LinkRow, ...]
     events: tuple[EventRow, ...]
     arbitrations: tuple[ArbitrationRow, ...]
+    #: 因分区不匹配被滤掉的历代版本条数（§10.6）：只说"有 N 条你看不到"，
+    #: 不透露它们的内容，也不让它们从输出里彻底消失。
+    hidden_history: int = 0
 
     def lines(self) -> tuple[str, ...]:
         """人读的展开文本。第一行是注入格式，后面是"为什么"。"""
@@ -185,6 +195,8 @@ class ExpandResult:
                     f"    {entry.id} [{entry.status}] {entry.valid_from or '?'}"
                     f" → {entry.valid_to or '现在'} {entry.content[:40]}{mark}"
                 )
+        if self.hidden_history:
+            out.append(f"  另有 {self.hidden_history} 个历史版本对该调用方不可见")
 
         if self.links:
             out.append("  关联：")
@@ -209,14 +221,34 @@ class ExpandResult:
         return tuple(out)
 
 
-def expand(conn: sqlite3.Connection, memory_id: str) -> ExpandResult:
-    """按 id 展开。找不到抛 ``ValueError``——静默返回空会让人以为"查过了没问题"。"""
+def expand(
+    conn: sqlite3.Connection,
+    memory_id: str,
+    *,
+    viewer: Viewer | None = None,
+    show_all: bool = False,
+) -> ExpandResult:
+    """按 id 展开。找不到抛 ``ValueError``——静默返回空会让人以为"查过了没问题"。
+
+    ``viewer`` / ``show_all`` 是 §10.6 的读路径口径：默认空身份，``private`` 条目
+    直接抛 :class:`MemoryNotVisible`，**异常里不含正文**。``show_all`` 只给本地 CLI 用，
+    MCP 工具不暴露——agent 不该有"看全部"的开关。
+
+    连带数据（历代版本 / 关联边 / 审计事件）走同一个口径：留一条边就泄漏了
+    "某条记忆跟另一个 session 的内容有关"。
+    """
+    who = viewer or Viewer()
     row = conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
     if row is None:
         raise ValueError(f"没有这条记忆：{memory_id}")
+    if not show_all:
+        blocked = deny_reason(row, who)
+        if blocked is not None:
+            raise MemoryNotVisible(memory_id, blocked)
     detail = MemoryDetail.from_row(row)
 
     history: tuple[MemoryDetail, ...] = (detail,)
+    hidden_history = 0
     if detail.fact_key is not None:
         rows = conn.execute(
             """
@@ -227,7 +259,30 @@ def expand(conn: sqlite3.Connection, memory_id: str) -> ExpandResult:
             """,
             (detail.fact_key, detail.scope, detail.project_id),
         ).fetchall()
-        history = tuple(MemoryDetail.from_row(item) for item in rows)
+        kept = rows if show_all else [item for item in rows if deny_reason(item, who) is None]
+        hidden_history = len(rows) - len(kept)
+        history = tuple(MemoryDetail.from_row(item) for item in kept)
+
+    raw_links = conn.execute(
+        "SELECT src, dst, type, weight FROM memory_links "
+        "WHERE src = ? OR dst = ? ORDER BY type, src, dst",
+        (memory_id, memory_id),
+    ).fetchall()
+    if show_all:
+        visible_neighbours = None
+    else:
+        neighbours = {
+            str(item["dst"]) if str(item["src"]) == memory_id else str(item["src"])
+            for item in raw_links
+        }
+        neighbours.discard(memory_id)
+        visible_neighbours = visible_ids(conn, tuple(neighbours), who)
+
+    def _link_is_visible(item: sqlite3.Row) -> bool:
+        if visible_neighbours is None:
+            return True
+        other = str(item["dst"]) if str(item["src"]) == memory_id else str(item["src"])
+        return other == memory_id or other in visible_neighbours
 
     links = tuple(
         LinkRow(
@@ -236,23 +291,24 @@ def expand(conn: sqlite3.Connection, memory_id: str) -> ExpandResult:
             type=str(item["type"]),
             weight=float(item["weight"]),
         )
-        for item in conn.execute(
-            "SELECT src, dst, type, weight FROM memory_links "
-            "WHERE src = ? OR dst = ? ORDER BY type, src, dst",
-            (memory_id, memory_id),
-        ).fetchall()
+        for item in raw_links
+        if _link_is_visible(item)
     )
 
+    event_rows = conn.execute(
+        "SELECT ts, type, payload, scope, visibility, project_id, host, session "
+        "FROM events WHERE target = ? ORDER BY id",
+        (memory_id,),
+    ).fetchall()
+    if not show_all:
+        event_rows = [item for item in event_rows if event_deny_reason(item, who) is None]
     events = tuple(
         EventRow(
             ts=str(item["ts"]),
             type=str(item["type"]),
             payload=None if item["payload"] is None else str(item["payload"]),
         )
-        for item in conn.execute(
-            "SELECT ts, type, payload FROM events WHERE target = ? ORDER BY id",
-            (memory_id,),
-        ).fetchall()
+        for item in event_rows
     )
 
     arbitrations = tuple(
@@ -277,4 +333,5 @@ def expand(conn: sqlite3.Connection, memory_id: str) -> ExpandResult:
         links=links,
         events=events,
         arbitrations=arbitrations,
+        hidden_history=hidden_history,
     )

@@ -19,6 +19,7 @@ from datetime import datetime
 
 from nebula.core.assertion import rank as assertion_rank
 from nebula.core.timeutil import now_ts, parse_ts
+from nebula.core.viewer import Viewer, deny_reason
 from nebula.recall.detail import ExpandResult, MemoryDetail, expand
 
 
@@ -27,14 +28,17 @@ class Explanation:
     memory_id: str
     recallable: bool
     reasons: tuple[str, ...]
-    detail: ExpandResult
+    #: 不可见时为 ``None``：判定本身不需要正文。把内容装进对象再"记得不打印"，
+    #: 是以后泄漏的起点（§10.6）。
+    detail: ExpandResult | None = None
 
     def lines(self) -> tuple[str, ...]:
         head = "可召回" if self.recallable else "不可召回"
         out = [f"{head}：{self.memory_id}"]
         out.extend(f"  - {reason}" for reason in self.reasons)
-        out.append("")
-        out.extend(self.detail.lines())
+        if self.detail is not None:
+            out.append("")
+            out.extend(self.detail.lines())
         return tuple(out)
 
 
@@ -43,14 +47,32 @@ def explain(
     memory_id: str,
     *,
     viewer_session: str | None = None,
+    viewer: Viewer | None = None,
+    show_all: bool = False,
     now: str | None = None,
 ) -> Explanation:
     """按候选池谓词逐条检查，返回第一处拦截原因与完整来历。
 
     ``viewer_session`` 与 ``recall`` 同义：不传就当作"没有私有分区身份"，
     private 条目会被判为不可见（这才是真实调用方的默认处境）。
+    ``viewer`` 是 P1.5 的完整身份（session + project + host）；两个都给时以 ``viewer`` 为准。
+
+    **不可见时短路**：只给"不可见"这一条理由，不再判状态、时间窗与席位。
+    理由集合本身也是信息——"它在回收站里"不该被别的分区反推出来。
     """
-    detail = expand(conn, memory_id)
+    who = viewer if viewer is not None else Viewer(session_id=viewer_session)
+    row = conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"没有这条记忆：{memory_id}")
+
+    if not show_all:
+        denied = deny_reason(row, who)
+        if denied is not None:
+            return Explanation(
+                memory_id=memory_id, recallable=False, reasons=(denied,), detail=None
+            )
+
+    detail = expand(conn, memory_id, viewer=who, show_all=show_all)
     mem = detail.memory
     stamp = now or now_ts()
     parsed_now = parse_ts(stamp)
@@ -79,12 +101,8 @@ def explain(
             successor = f"，被 {mem.superseded_by} 取代" if mem.superseded_by else ""
             reasons.append(f"已失效：valid_to = {mem.valid_to}{successor}")
 
-    if mem.visibility == "private" and (viewer_session is None or mem.session_id != viewer_session):
-        blocked = True
-        reasons.append(
-            f"私有分区：只对 session={mem.session_id} 可见，当前调用方"
-            + (f"是 {viewer_session}" if viewer_session else "没有 session 身份")
-        )
+    # 私有分区那一闸已由 deny_reason 在上方短路，这里不再重复判——两处同一条规则
+    # 迟早会分叉（P1 审查 M-2 的教训：explain 与 recall 各写一份，结论就相反）。
 
     if not blocked:
         seat = _seat_check(conn, mem, parsed_now)

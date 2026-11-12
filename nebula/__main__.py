@@ -17,9 +17,15 @@ import json
 import sqlite3
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 
 from nebula import __version__
+from nebula.adapter.pointer import install as install_pointer
+from nebula.adapter.pointer import render_block
+from nebula.adapter.pointer import uninstall as remove_pointer
+from nebula.adapter.project import resolve as project_resolve
 from nebula.core.timeutil import now_ts
+from nebula.core.viewer import Viewer
 from nebula.lifecycle.decay import plan as lifecycle_plan
 from nebula.lifecycle.sleep import run_sleep
 from nebula.recall.detail import expand
@@ -27,6 +33,23 @@ from nebula.recall.explain import explain
 from nebula.recall.search import recall
 from nebula.store.db import open_database, resolve_db_path, schema_version
 from nebula.store.write_service import InvariantViolation, WriteService
+
+
+def _add_viewer_args(parser: argparse.ArgumentParser) -> None:
+    """读路径的身份参数（§10.6）。缺省即"无身份"：private 条目一律不可见。"""
+    parser.add_argument("--session", dest="session", default=None, help="私有分区身份")
+    parser.add_argument("--project", dest="project", default=None, help="项目作用域 id")
+    parser.add_argument("--host", dest="host", default=None, help="宿主名（host 作用域）")
+    parser.add_argument(
+        "--show-all",
+        dest="show_all",
+        action="store_true",
+        help="本机查看全部分区（仅 CLI；MCP 工具不提供这个开关）",
+    )
+
+
+def _viewer_of(args: argparse.Namespace) -> Viewer:
+    return Viewer(session_id=args.session, project_id=args.project, host=args.host)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -59,6 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     remember_parser.add_argument("--role", default="user", help="写入方角色（默认 user）")
     remember_parser.add_argument("--scope", default="global", choices=["global", "project", "host"])
+    remember_parser.add_argument("--host", default=None, help="宿主名（scope=host 时必填）")
     remember_parser.add_argument("--project", dest="project_id", default=None)
     remember_parser.add_argument("--importance", type=float, default=0.5)
     remember_parser.add_argument("--valid-from", dest="valid_from", default=None)
@@ -75,6 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
     recall_parser.add_argument("--scope", default=None, choices=["global", "project", "host"])
     recall_parser.add_argument("--project", dest="project_id", default=None)
     recall_parser.add_argument("--session", dest="viewer_session", default=None)
+    recall_parser.add_argument("--host", default=None, help="调用方宿主名（决定 host 分区可见性）")
     recall_parser.add_argument("--json", action="store_true", help="输出 JSON")
     recall_parser.add_argument(
         "--no-record",
@@ -89,12 +114,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     explain_parser.add_argument("memory_id", help="记忆 id（形如 mem-12）")
     explain_parser.add_argument("--db", default=None)
-    explain_parser.add_argument("--session", dest="viewer_session", default=None)
+    _add_viewer_args(explain_parser)
     explain_parser.set_defaults(handler=_cmd_explain)
 
     expand_parser = subparsers.add_parser("expand", help="展开一条记忆的完整来历")
     expand_parser.add_argument("memory_id")
     expand_parser.add_argument("--db", default=None)
+    _add_viewer_args(expand_parser)
     expand_parser.set_defaults(handler=_cmd_expand)
 
     forget_parser = subparsers.add_parser("forget", help="遗忘（进回收站，30 天内可复原）")
@@ -123,6 +149,28 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser.add_argument("--db", default=None)
     status_parser.set_defaults(handler=_cmd_status)
 
+    pointer_parser = subparsers.add_parser(
+        "pointer", help="指令文件里的记忆指针块（B 档接入）"
+    )
+    pointer_sub = pointer_parser.add_subparsers(dest="pointer_action", required=True)
+    pointer_show = pointer_sub.add_parser("show", help="打印指针块内容")
+    pointer_show.set_defaults(handler=_cmd_pointer_show)
+    pointer_install = pointer_sub.add_parser("install", help="写入或更新指针块（幂等）")
+    pointer_install.add_argument(
+        "--file",
+        required=True,
+        help="目标指令文件，如 ./CLAUDE.md 或 ./AGENTS.md；必填，避免写错位置",
+    )
+    pointer_install.set_defaults(handler=_cmd_pointer_install)
+    pointer_uninstall = pointer_sub.add_parser("uninstall", help="移除指针块")
+    pointer_uninstall.add_argument("--file", required=True)
+    pointer_uninstall.set_defaults(handler=_cmd_pointer_uninstall)
+
+    project_parser = subparsers.add_parser("project", help="看当前目录解析出的项目 id")
+    project_parser.add_argument("--path", default=None, help="起点目录（默认当前目录）")
+    project_parser.add_argument("--project", dest="explicit", default=None, help="显式指定 id")
+    project_parser.set_defaults(handler=_cmd_project)
+
     return parser
 
 
@@ -147,6 +195,7 @@ def _cmd_remember(args: argparse.Namespace) -> int:
             args.content,
             scope=args.scope,
             project_id=args.project_id,
+            host=args.host,
             kind=args.kind,
             assertion_type=args.assertion_type,
             role=args.role,
@@ -189,6 +238,7 @@ def _cmd_recall(args: argparse.Namespace) -> int:
             scope=args.scope,
             project_id=args.project_id,
             viewer_session=args.viewer_session,
+            viewer_host=args.host,
             record=args.record,
         )
     finally:
@@ -228,7 +278,9 @@ def _cmd_recall(args: argparse.Namespace) -> int:
 def _cmd_explain(args: argparse.Namespace) -> int:
     conn = open_database(args.db)
     try:
-        result = explain(conn, args.memory_id, viewer_session=args.viewer_session)
+        result = explain(
+            conn, args.memory_id, viewer=_viewer_of(args), show_all=args.show_all
+        )
     finally:
         conn.close()
     for line in result.lines():
@@ -239,7 +291,9 @@ def _cmd_explain(args: argparse.Namespace) -> int:
 def _cmd_expand(args: argparse.Namespace) -> int:
     conn = open_database(args.db)
     try:
-        result = expand(conn, args.memory_id)
+        result = expand(
+            conn, args.memory_id, viewer=_viewer_of(args), show_all=args.show_all
+        )
     finally:
         conn.close()
     for line in result.lines():
@@ -353,6 +407,45 @@ def _cmd_status(args: argparse.Namespace) -> int:
         print(f"回收站：{recycled} · 置顶：{pinned}")
     finally:
         conn.close()
+    return 0
+
+
+def _cmd_pointer_show(args: argparse.Namespace) -> int:
+    print(render_block())
+    return 0
+
+
+def _cmd_pointer_install(args: argparse.Namespace) -> int:
+    target = Path(args.file)
+    action = install_pointer(target)
+    labels = {
+        "created": "已新建并写入",
+        "appended": "已追加到文件末尾",
+        "updated": "已更新既有指针块",
+        "unchanged": "已是最新，未改动",
+    }
+    print(f"{labels.get(action, action)}：{target}")
+    if action in ("created", "appended"):
+        print("提示：这是说明书，不是存储——记忆本身仍在 Nebula 库里。")
+    return 0
+
+
+def _cmd_pointer_uninstall(args: argparse.Namespace) -> int:
+    target = Path(args.file)
+    if not remove_pointer(target):
+        print(f"{target} 里没有 nebula 指针块")
+        return 0
+    print(f"已移除指针块：{target}")
+    return 0
+
+
+def _cmd_project(args: argparse.Namespace) -> int:
+    ref = project_resolve(args.path, explicit=args.explicit)
+    print(f"project_id：{ref.project_id}")
+    print(f"来源：{ref.source}" + ("（非 git 目录：换路径就会失忆）" if ref.is_loose else ""))
+    print(f"根目录：{ref.root}")
+    if ref.name:
+        print(f"名字：{ref.name}")
     return 0
 
 

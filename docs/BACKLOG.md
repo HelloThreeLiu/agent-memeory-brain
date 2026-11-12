@@ -23,7 +23,7 @@
 - 并发：两进程各写 100 条 → 200 个唯一 id，`seq` = 1..200 无洞（连跑 5 次稳定）。
 - 唯一未命中的查询是「用什么数据库存储数据」——问句太泛，"数据/存储"命中了一堆邻近主题。合成种子的局限，等 P1.5 真实日志再校准。
 
-## 当前批次：P1 生命周期（目标：会忘、能复原、能追责）—— 已收口
+## 上批：P1 生命周期（目标：会忘、能复原、能追责）—— 已收口
 
 | ID | 类型 | 级别 | 事项 | 验收标准 | 状态 |
 |---|---|---|---|---|---|
@@ -44,6 +44,62 @@
 - 回收站往返：29 天可复原、31 天拒绝；`purge_expired` 只删超期行，且先清 links / arbitration 再删主体。
 - 仲裁终态：left/right 输家退出当前区间但行保留、claim 输家转 `archived(refuted)`、`both` 两条都不动、重复裁决被拒、输家已失效时不撞 INV3 触发器。
 - 并发用例的成功率：单跑 6/6、全量 16/16 绿；此前在 build 同时进行时失败过 1 次（约 1/20 量级），是 Q-9 那条 Windows 多进程瞬态问题。审查修复批次补了 `BEGIN` 有界重试，但没有清零，故 Q-9 记为"部分收口"而非"已收口"。
+
+## 当前批次：P1.5a 接入面（目标：宿主能调、日志能攒、私有分区不漏）
+
+> 切分理由：a 段全部可在本机自动化验证；b 段（选宿主、配 MCP、连续用 5 天）需要外部时间。
+> 设计口径见 §10.6（读路径可见性）与 §10.5（B 档注入落法）。
+
+| ID | 类型 | 级别 | 事项 | 验收标准 | 状态 |
+|---|---|---|---|---|---|
+| A-1 | feat(schema) | L | schema v4：`injection_log` / `feedback` 两表 | v3→v4 升级用例绿；§8.1.1 文档 DDL 同步门禁绿；旧库升级后原有行不受影响 | done |
+| A-2 | feat(store) | L | 写口 `log_injection` / `record_feedback` | 每次都落一行且同事务落 `events`；`feedback` 对不存在的 id 报错而非静默；断言会红 | done |
+| A-3 | feat(recall) | L | 读路径可见性口径（§10.6，收口 R-8） | `expand`/`explain` 对 private 无 session 调用方返回"不可见"且**输出不含原文**；`events` 按 scope/visibility 过滤；CLI `--show-all` 可看全部 | done |
+| A-4 | feat(adapter) | M | `project_id` 解析（§10.4）+ B 档指针块生成器（§10.5） | git remote / git toplevel / 非 git 路径三种解析用例；指针块重复 install 幂等、uninstall 无残留 | done |
+| A-5 | feat(mcp) | L | 零依赖 MCP stdio server + `remember`/`recall`/`expand`/`feedback` 四工具 | `initialize → tools/list → tools/call` 全流程可跑；`recall` 每次落 `injection_log`；断网与零 LLM 均可用；不新增运行时依赖 | done |
+| A-6 | test(mcp) | L | 接入面专项门禁 | subprocess 逐行 JSON-RPC 端到端用例；四工具各 ≥1 契约用例 + 错误路径；全门禁绿 + wheel 可出 | done |
+
+**实测结果（2026-11-11，本机 Python 3.13.12 / SQLite 3.53.1）**
+
+- 门禁：`ruff` 0 问题 / `mypy --strict` 0 问题（29 文件）/ `pytest` **227 passed** / `python -m build` 出 `nebula_memory-0.0.3` wheel（零运行时依赖，`pip-audit` 按 CI 口径跳过；wheel 内含新增的 `nebula/mcp/` 与 `nebula/adapter/`，已解包核对）。
+- **协议**：真起子进程喂 stdio 跑通 `initialize → notifications/initialized → tools/list → remember → recall → feedback`；故意发一行坏 JSON 后进程不退出，下一条 `ping` 正常响应。`protocolVersion` 原样回显客户端值。
+- **注入日志**：命中与未命中的召回各落一行（`memory_ids` 分别是 `[]` 与 `["mem-1"]`），`host`/`project_id` 落全，`chars` 为实际注入文本长度。
+- **可见性**：private 条目对别的 session 的 `expand` 返回"不可见"，输出与异常文本**都不含原文**（断言同时查 `9222` 与整句）；历史版本按同口径过滤并给出"N 个版本不可见"；无分区信息的历史事件不返回。反例验证：去掉 private 判定后 11 条用例里 6 条变红。
+- **反馈回连**：用 `json_each` 而非 `LIKE` 找最近注入——专测 `mem-1` / `mem-10` 前缀歧义，反馈不会挂错注入。
+- **project 解析**：remote / toplevel / loose / manifest 四种来源各有用例；同一 remote 的两个本地路径得到同一个 id（这正是它存在的理由）。
+- **指针块**：install 幂等（第二次 `unchanged`）、uninstall 后原文逐字节恢复、CRLF 文件保持 CRLF、标记不成对时抛错且一个字节不改。手动往返冒烟已跑。
+- **loose 目录**：非 git 目录不让路径 hash 冒充项目边界——读过滤不用它、`remember` 默认退回 `global`、显式要 `scope=project` 时要求给真 id。
+
+**未覆盖、留给 b 段**：真宿主上的工具调用成功率（模型会不会主动调 `recall`）、5 天 ≥300 条注入记录、三项指标报告、阈值是否要调。这些都需要真实对话量，本机自动化测不出来。
+
+**b 段范围外清单**（明确不在本批做）：选宿主与写配置、指针块写进真实仓库、连续 5 天使用、`nebula report` 三项指标、阈值校准结论、负反馈是否降 `confidence`（要基线才能定降多少，现在拍数字就是猜）。
+
+## 审查记录（P1.5a，独立会话执行）
+
+原始报告 `.reviews/CODE-REVIEW-P1.5a-adapter-2026-11-11.md`（过程稿，不入库）。结论「修复后通过」，**C-1 / M-1 阻塞合并**。以下每条都有会红的用例或实跑输出。
+
+| 编号 | 级别 | 问题 | 处理 | 验证证据 |
+|---|---|---|---|---|
+| C-1 | **Critical** | `_fetch_pool` 在 `project_id` 为 None 时**不加任何 scope 条件**，loose 视图等于全库视图：别的项目的 `scope=project` 条目、所有宿主的 `scope=host` 条目都会被召回注入。而 `deny_reason` 判它们"不可见"——两套口径分叉，P1 审查 M-2 在 scope 轴重演 | 口径下沉到 `nebula/core/viewer.py`（`store` 不该反向依赖 `recall`）：新增 `visibility_predicate` / `scope_predicate` 两个 SQL 片段，与 `deny_reason` 逐条对应；`_fetch_pool` 用它们拼条件，返回前再用 `deny_reason` 复核（只能再删不能补回，失败方向是少召回而非泄漏） | 复现脚本实跑：loose 查项目A / 宿主X 均 `[]`（修复前分别是 `['mem-1']` / `['mem-2']`）；新增 `test_loose_recall_does_not_leak_other_partitions`；反例：SQL 谓词恒真 → 16 条红；旧 `_fetch_pool` 全量视图+无复核 → 20 条红 |
+| M-1 | **Major** | `scope=host` 写得到、召不回：项目视图谓词 `(scope='global' OR project_id=?)` 把 host 行（`project_id=NULL`）排除，recall 根本没有 host 维度 | 同一处修复加 host 分支；`recall` 新增 `viewer_host`，MCP/CLI 都传；`remember` 在写口要求 `scope=host` 必须带 `host` | `test_host_scope_is_not_in_project_view` 断言同宿主命中、异宿主不命中（修复前同宿主也是 `[]`）；实跑 myhost 条目在 `project_id=proj-B` 视图下由 `[]` → `['mem-3']`；反例：去掉 host 分支 → 4 条红 |
+| m-2 | Minor | `deny_reason` 的 reason 带 owner 的 session id / project hash / host 名，经 `expand`/`explain` 回给模型 | 措辞只留维度名："visibility 不匹配（private 分区…）" / "scope 不匹配（属于另一个项目/宿主）" | 三条断言：reason 不含 `s-1`、`p-1`、`claude-code` |
+| m-3 | Minor | `record_feedback` 不校验可见性，可对他人私有条目写 note；且"没有这条记忆"构成 id 存在性预言机 | `record_feedback` 新增 `viewer`，不可见与不存在**报同一句话**；MCP 传 `ctx.viewer` | `test_feedback_on_invisible_memory_looks_exactly_like_missing`：除 id 外措辞逐字一致，`feedback`/`events` 均为 0 行；`test_owner_can_still_give_feedback_on_own_private_memory` 保证没误杀 |
+| n-4 | Nit | `pointer.has_block` 无调用方（死代码） | 删除 | ruff 无未使用告警 |
+| n-5 | Nit | v4 两表用 `session`，`memories` 用 `session_id` | **不改**，与 `events` 对齐；记档待 P4 统一 | — |
+| n-6 | Nit | 混合换行文件在改写时会被统一成多数换行 | **记档**：`install` 判定 `unchanged` 时不碰文件，只有确实要改块时才重写全文；已写进 `_read` 的 docstring | — |
+
+**审查观察项**（不阻塞，登记备查）
+
+1. `injection_log` / `feedback` 无保留策略——等 b 段数据量出来再定清理规则。
+2. `_latest_injection` 不按 host/session 过滤，反馈可能挂到别的 session 的注入上——只影响指标归因，报告口径注意。
+3. 模型自报 `role="user"` 即可写 decision（INV6 靠工具描述约束，代码不拦）——B 档接受，P4 多 agent 接入前重估。
+4. `nebula.mcp` 从 spawn 时 cwd 推断项目——宿主以 home 为 cwd 启动时 git 项目会被判 loose；C-1 修复后读侧安全，写侧本来就退 global。
+
+**修复后复验（2026-11-12）**：`ruff` 0 / `mypy --strict` 0（29 文件）/ `pytest` **262 passed** / `python -m build` 出 `0.0.3` wheel。新增 35 条用例（30 格一致性参数化 + C-1 反例 + M-1 正例 + m-2/m-3 断言）。
+
+**复审（2026-11-12，独立会话）结论「通过」**，C-1 / M-1 / m-2 / m-3 / n-4 全部闭环，**R-8 正式收口**。复审对三条关键断言做了 mutation test（改坏实现看用例是否红）：只把 SQL 谓词改恒真 → 复核兜住不泄漏但一致性用例红；谓词与复核**双变异** → `['mem-1']` 泄漏复现、loose 用例变红；去掉 `record_feedback` 的 viewer 校验 → 反馈写入成功、用例变红。三条都咬合，不是"改断言让它绿"。
+
+复审同时确认一处**行为变化**（规格对齐，非回归）：CLI `nebula recall` 不带 `--project` / `--host` 时，从"全库视图"变为"仅 global 分区"——§10.6 现在对 CLI 同样生效。本机要看全部用显式身份参数或 `expand --show-all`。
 
 ## 原 P1 口子（Q-1..Q-9）的收口
 
@@ -70,7 +126,7 @@
 | R-5 | `resolution=merged` | §9.3 未定义合并后正文归属 |
 | R-6 | 快照 JSON | P2 星图才消费 |
 | R-7 | 半衰期分档表的真实校准 | 现为先验值，需要 P1.5 的召回日志 |
-| R-8 | `explain` / `expand` 输出不按 viewer/scope 过滤；`events` 的分区列暂无读路径消费 | P1 审查 n-8：与 U4/U8 开放口径一致，不算新洞；但 P1.5 把 expand 变成 agent 工具时即成跨 session 泄漏面，接宿主前必须先定口径 |
+| R-8 | `explain` / `expand` 输出不按 viewer/scope 过滤；`events` 的分区列暂无读路径消费 | **已收口（P1.5a A-3）**。读路径与召回同一条谓词（§10.6）；v4 给 `events` 补了 `project_id`，连带数据一起过滤；CLI 留 `--show-all` 逃生口，MCP 不暴露 |
 
 ## 审查记录（P1，独立会话执行）
 

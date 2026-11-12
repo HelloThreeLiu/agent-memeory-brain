@@ -120,7 +120,7 @@ def test_migrate_v1_to_v2_backfills_arbitration_slot(tmp_path: Path) -> None:
             (STAMP,),
         )
 
-        assert migrate(conn) == [2, 3]
+        assert migrate(conn) == [2, 3, 4]
         assert schema_version(conn) == CURRENT_SCHEMA_VERSION
         row = conn.execute(
             "SELECT scope, project_id, visibility, session_id FROM arbitration WHERE id = 'arb-1'"
@@ -152,7 +152,7 @@ def test_migrate_v2_to_v3_adds_lifecycle_and_backfills_events(tmp_path: Path) ->
         event_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(events)")}
         assert "scope" not in event_columns
 
-        assert migrate(conn) == [3]
+        assert migrate(conn) == [3, 4]
         row = conn.execute(
             "SELECT scope, visibility FROM events WHERE target = ?", (memory_id,)
         ).fetchone()
@@ -171,6 +171,45 @@ def test_migrate_v2_to_v3_adds_lifecycle_and_backfills_events(tmp_path: Path) ->
         # 回填只该在迁移事务里发生一次，装回触发器后 events 仍然 append-only
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute("UPDATE events SET type = 'tampered'")
+    finally:
+        conn.close()
+
+
+def test_migrate_v3_to_v4_adds_interface_tables(tmp_path: Path) -> None:
+    """旧库升级：v4 只加两表，不动已有行；升级后两表立即可用。"""
+    path = tmp_path / "v3.db"
+    conn = connect(path)
+    try:
+        assert migrate(conn, target=3) == [1, 2, 3]
+        memory_id = insert_memory(conn, 1, content="升级前的条目")
+        names = {
+            str(row["name"])
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        assert "injection_log" not in names
+        assert "feedback" not in names
+
+        assert migrate(conn) == [4]
+        names = {
+            str(row["name"])
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        assert {"injection_log", "feedback"} <= names
+
+        row = conn.execute("SELECT content FROM memories WHERE id = ?", (memory_id,)).fetchone()
+        assert row["content"] == "升级前的条目"
+
+        conn.execute(
+            "INSERT INTO injection_log (id, ts, query) VALUES ('inj-1', ?, 'q')", (STAMP,)
+        )
+        # kind 白名单在库层兜底：指标只认这三类，多一个值会让分母口径漂
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO feedback (id, ts, memory_id, kind, source) "
+                "VALUES ('fb-1', ?, ?, 'maybe', 'tool')",
+                (STAMP, memory_id),
+            )
+        assert migrate(conn) == []
     finally:
         conn.close()
 

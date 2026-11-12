@@ -2,9 +2,9 @@
 
 P0 只建"能存、能召回、能断言"真正用到的表：``memories`` / ``memory_links`` /
 ``episodes`` / ``events`` / ``arbitration``，加上 ``counter`` 与 ``schema_meta``。
-设计文档 §8.1 里其余表（projects / sessions / leases / injection_log / feedback /
-embeddings / snapshots / core_versions）等到 P1 / P4 用增量迁移加入——加表是纯增量，
-不会牵动已有表结构。
+设计文档 §8.1 里其余表（projects / sessions / leases / embeddings / snapshots /
+core_versions）等到 P4 用增量迁移加入——加表是纯增量，不会牵动已有表结构。
+``injection_log`` / ``feedback`` 已由 v4 加入（P1.5a 接入面）。
 
 不变量在这里用**数据库触发器**兜底（而不是只靠 Python 自觉）：绕开
 ``write_service`` 直接写库也会被拒，P0-2 的"断言会真红"才是真的。
@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -252,8 +252,71 @@ _V3_LIFECYCLE: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS ix_memories_recall ON memories (last_recalled)",
 )
 
+#: v4：接入面。两张表是 P1.5 三项指标的唯一数据源（§8.1 / §16.2）：
+#: 没有 `injection_log`，"负反馈率"没有分母；没有 `feedback`，"信任衰减"无从观测。
+_V4_INTERFACE: tuple[str, ...] = (
+    # 事件表缺 project_id：v3 补了 scope/visibility，但 `scope='project'` 的事件
+    # 只能看出"属于某个项目"，看不出是哪个 → 读路径没法过滤，只能一律不显示。
+    # 补列后 §10.6 的连带数据过滤才成立（P1.5a，R-8）。
+    "DROP TRIGGER IF EXISTS trg_events_no_update",
+    "ALTER TABLE events ADD COLUMN project_id TEXT",
+    """
+    UPDATE events SET project_id = (
+        SELECT project_id FROM memories WHERE memories.id = events.target
+    ) WHERE EXISTS (SELECT 1 FROM memories WHERE memories.id = events.target)
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_events_no_update
+    BEFORE UPDATE ON events
+    FOR EACH ROW
+    BEGIN
+        SELECT RAISE(ABORT, 'events 是 append-only，不允许 UPDATE');
+    END
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS injection_log (
+        id             TEXT PRIMARY KEY,
+        ts             TEXT NOT NULL,
+        host           TEXT,
+        session        TEXT,
+        project_id     TEXT,
+        query          TEXT NOT NULL,
+        memory_ids     TEXT NOT NULL DEFAULT '[]',
+        chars          INTEGER NOT NULL DEFAULT 0,
+        top_k          INTEGER NOT NULL DEFAULT 0,
+        degraded_level INTEGER NOT NULL DEFAULT 0,
+        elapsed_ms     REAL
+    )
+    """,
+    # 只存 id 列表与字数，不存注入正文：日志是给指标用的，不是第二条记忆副本。
+    # query 存原文是因为"哪种问法召不回来"只能从原话看出来；库在本机，不进仓库。
+    "CREATE INDEX IF NOT EXISTS ix_injection_log_ts ON injection_log (ts)",
+    """
+    CREATE TABLE IF NOT EXISTS feedback (
+        id           TEXT PRIMARY KEY,
+        ts           TEXT NOT NULL,
+        memory_id    TEXT NOT NULL,
+        kind         TEXT NOT NULL CHECK (kind IN ('useful', 'useless', 'wrong')),
+        source       TEXT NOT NULL,
+        host         TEXT,
+        session      TEXT,
+        note         TEXT,
+        injection_id TEXT
+    )
+    """,
+    # 故意不加 REFERENCES memories(id)：
+    # 1) feedback 是审计事实（"用户说过这条错了"），召回主体 30 天后被 purge 掉，
+    #    这个事实不该跟着消失；
+    # 2) 加外键会让 purge_expired 被反馈阻塞——数据回退优先于引用完整性（§7 回滚预案）。
+    # 代价是可能出现"孤儿反馈"，报告里单独计一列，不混进分母。
+    "CREATE INDEX IF NOT EXISTS ix_feedback_memory ON feedback (memory_id, ts)",
+    "CREATE INDEX IF NOT EXISTS ix_feedback_injection ON feedback (injection_id)",
+)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(version=1, name="p0-base", statements=_P0_STATEMENTS),
     Migration(version=2, name="arbitration-slot", statements=_V2_ARBITRATION_SLOT),
     Migration(version=3, name="lifecycle", statements=_V3_LIFECYCLE),
+    Migration(version=4, name="interface", statements=_V4_INTERFACE),
 )

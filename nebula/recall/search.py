@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from nebula.core import scoring
 from nebula.core.assertion import rank as assertion_rank
@@ -208,18 +210,45 @@ def recall(
         for item in seated[:limit]
     )
     if record and hits:
-        # 记账与唤醒分开：全部命中都算"被用过"（Q-8），但只有相关性到阈值的
-        # 才算"被真的想起来"、值得把 dormant 拉回 active（§9.5 唤醒阈值）。
-        woken = [hit.id for hit in hits]
-        wake = [
-            hit.id for hit in hits if hit.pinned or hit.relevance >= policy.WAKE_RELEVANCE
-        ]
-        WriteService(conn).touch_recall(woken, wake_ids=wake, now=parse_ts(stamp))
+        record_hits(conn, hits, host=viewer.host, session_id=viewer.session_id, now=stamp)
     return RecallResult(
         query=query,
         hits=hits,
         candidate_count=len(candidates),
         elapsed_ms=_ms(started),
+    )
+
+
+def record_hits(
+    conn: sqlite3.Connection,
+    hits: Sequence[Hit],
+    *,
+    host: str | None = None,
+    session_id: str | None = None,
+    now: str | datetime | None = None,
+) -> int:
+    """把**实际注入给模型的**命中记账（BACKLOG Q-8），返回记账条数。
+
+    口径是"被注入即算用过"：全部命中写 ``last_recalled`` / ``recall_count``，
+    只有相关性达唤醒阈值的才把 ``dormant`` 拉回 ``active``（§9.5）。两件事分开，
+    是因为弱命中确实参与了这一轮回答，只是不够格算"被想起来"（P1 审查 m-4）。
+
+    **抽成公开函数而不是留在 ``recall()`` 里，是 A 档接入的要求**（P1.5c 评审 M-1）：
+    hook 必须"先按预算截断、再对最终进入注入块的条目记账"，否则被截断挤掉的条目
+    会"记了账没注入"，同一条记忆每轮 +1、``last_recalled`` 永不老化，§9.5 的
+    「30 天未召回」永远不触发。这是静默污染，且没有事后修复工具。
+
+    ``host`` / ``session_id`` 是事件归属：B 档经 MCP 调用时来自 ``ToolContext``，
+    hook 调用时来自 stdin 的 payload。早先版本这两处没传，``events.host`` 恒为
+    NULL——按 §10.6 的分区口径过滤后，这些事件读不到。
+    """
+    ids = [hit.id for hit in hits]
+    if not ids:
+        return 0
+    wake = [hit.id for hit in hits if hit.pinned or hit.relevance >= policy.WAKE_RELEVANCE]
+    moment = now if now is None or isinstance(now, datetime) else parse_ts(now)
+    return WriteService(conn).touch_recall(
+        ids, wake_ids=wake, now=moment, host=host, session_id=session_id
     )
 
 

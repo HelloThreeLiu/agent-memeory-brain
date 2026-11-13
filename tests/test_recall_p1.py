@@ -12,7 +12,7 @@ from nebula.core.timeutil import fmt
 from nebula.lifecycle import policy
 from nebula.recall.detail import expand
 from nebula.recall.explain import explain
-from nebula.recall.search import recall
+from nebula.recall.search import recall, record_hits
 from nebula.store.write_service import WriteResult, WriteService
 
 BASE = datetime(2026, 5, 1, 9, 0, tzinfo=UTC)
@@ -332,3 +332,49 @@ def test_explain_now_parameter_is_used(
     )
     assert explain(conn, item.id, now=fmt(BASE)).recallable is False
     assert explain(conn, item.id, now=fmt(BASE + timedelta(days=60))).recallable is True
+
+
+# ------------------------------------------------- record_hits（P1.5c M-1 地基）
+
+
+def test_record_hits_only_touches_the_given_hits(
+    conn: sqlite3.Connection, write: Callable[..., WriteResult]
+) -> None:
+    """只对**真正进入注入块**的命中记账。
+
+    A 档（hook）会先按预算截断再记账；若把截断前的全部命中都记账，同一条记忆
+    每轮 +1、``last_recalled`` 永不老化，§9.5 的「30 天未召回」永远不触发。
+    """
+    first = write("构建用 npm 跑打包", fact_key="build.a")
+    second = write("构建用 make 跑打包", fact_key="build.b")
+    third = write("构建用 cargo 跑打包", fact_key="build.c")
+
+    found = recall(conn, "构建用", 5, record=False).hits
+    picked = [hit for hit in found if hit.id in {first.id, second.id}]
+    assert len(picked) == 2
+
+    assert record_hits(conn, picked, host="workbuddy", session_id="s-1") == 2
+    assert memories(conn, first.id)["recall_count"] == 1
+    assert memories(conn, second.id)["recall_count"] == 1
+    # 没进注入块的那条一条都不能动
+    assert memories(conn, third.id)["recall_count"] == 0
+
+
+def test_record_hits_carries_host_and_session_into_events(
+    conn: sqlite3.Connection, write: Callable[..., WriteResult]
+) -> None:
+    """事件归属：早先版本没传 host/session，events 恒为 NULL，按分区过滤后读不到。"""
+    item = write("随便一条记录")
+    hits = recall(conn, "随便", 5, record=False).hits
+    record_hits(conn, hits, host="workbuddy", session_id="s-9")
+    row = conn.execute(
+        "SELECT host, session FROM events WHERE type = 'memory.recalled' AND target = ?",
+        (item.id,),
+    ).fetchone()
+    assert row is not None
+    assert row["host"] == "workbuddy"
+    assert row["session"] == "s-9"
+
+
+def test_record_hits_with_no_hits_is_noop(conn: sqlite3.Connection) -> None:
+    assert record_hits(conn, []) == 0

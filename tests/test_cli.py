@@ -71,6 +71,16 @@ def test_status_reports_counts(tmp_path: Path) -> None:
     assert "当前有效：1" in result.stdout
 
 
+def test_status_shows_the_event_count(tmp_path: Path) -> None:
+    """§10.7 的决策：events 不清理，但要让"它在长"这件事看得见。"""
+    db = tmp_path / "cli.db"
+    run_cli(db, "remember", "接口统一用 POST")
+    assert "审计事件：1" in run_cli(db, "status").stdout
+
+    run_cli(db, "pin", "mem-1")
+    assert "审计事件：2" in run_cli(db, "status").stdout
+
+
 def test_status_uses_the_current_window(tmp_path: Path) -> None:
     """未来才生效的条目不该算进"当前有效"。"""
     db = tmp_path / "cli.db"

@@ -154,3 +154,20 @@ def resolve(start: str | Path | None = None, *, explicit: str | None = None) -> 
     return ProjectRef(
         project_id=_digest(str(origin)), root=origin, source="loose", name=origin.name
     )
+
+
+def resolve_for_host(start: str | Path | None = None) -> ProjectRef | None:
+    """宿主侧调用方（hook / MCP）的"有效项目"：非 git 目录返回 ``None``。
+
+    ``None`` 的语义是"没有项目身份"，不是"看全部"——读路径随之只看得见 ``global``
+    分区（§10.6）。不拿 loose 的路径 hash 凑一个 id，是因为那个 id 换盘符就失效，
+    用它当作用域边界会把记忆绑在一个假项目上（§10.4 的"换盘符就失忆"）。
+
+    解析失败也返回 ``None`` 而不是抛：hook 的失败方向必须是"少注入"，不能是
+    "整条链路挂掉"。
+    """
+    try:
+        ref = resolve(start)
+    except OSError:  # Windows 上个别被占用的路径 resolve 会抛
+        return None
+    return None if ref.is_loose else ref

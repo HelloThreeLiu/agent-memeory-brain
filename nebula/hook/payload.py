@@ -33,6 +33,8 @@ class Payload:
     cwd: str | None
     prompt: str
     transcript_path: str | None
+    #: 只有 ``SessionStart`` 有：``startup`` / ``resume`` / ``clear``（探针实测前两种）
+    source: str | None = None
 
 
 def parse(raw: str) -> Payload:
@@ -46,6 +48,7 @@ def parse(raw: str) -> Payload:
         cwd=_text(data, "cwd"),
         prompt=_text(data, "prompt") or "",
         transcript_path=_text(data, "transcript_path"),
+        source=_text(data, "source"),
     )
 
 

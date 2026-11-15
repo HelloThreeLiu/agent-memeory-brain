@@ -19,20 +19,18 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 import time
 from collections.abc import Sequence
-from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 
-from nebula.adapter.project import resolve as resolve_project
+from nebula.adapter.project import resolve_for_host
 from nebula.core.timeutil import fmt, now_ts
 from nebula.hook.dedup import seen_ids
 from nebula.hook.payload import Payload, internal_message, parse
 from nebula.hook.render import PROMPT_TOP_K, render_prompt_block
-from nebula.hook.summary import failure, line
+from nebula.hook.summary import emit, failure, line, note, utf8_streams
 from nebula.recall.search import recall, record_hits
 from nebula.store.db import open_database
 from nebula.store.write_service import WriteService
@@ -137,18 +135,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     """**永远返回 0**（§10.7 fail-open）：记忆系统不能成为可用性单点。"""
-    _utf8_streams()
+    utf8_streams()
     # 用 parse_known_args：宿主可能在命令行尾巴上多塞事件名之类的参数（Beta 接口），
     # 多一个参数就抛 SystemExit=2 会让 hook 直接失败
     args, _ = build_parser().parse_known_args(argv)
     try:
         outcome = run(parse(sys.stdin.read()), args.db, host=args.host)
         if outcome.context:
-            _emit(outcome.context)
+            emit("UserPromptSubmit", outcome.context)
     except Exception as exc:  # 库、检索、渲染、输出，任何一步出错都不许传导给宿主
-        _note(failure(exc))
+        note(failure(exc))
         return 0
-    _note(outcome.summary)
+    note(outcome.summary)
     return 0
 
 
@@ -156,45 +154,9 @@ def _project_of(cwd: str | None) -> str | None:
     """从 stdin 的 ``cwd`` 解析项目（§10.4）；解析不了或落在非 git 目录时返回 ``None``。
 
     ``None`` 的意思是"只看得见 ``global`` 分区"（§10.6），不是"看全部"。
-    **不拿路径 hash 凑数**：loose project 换盘符就失忆，把它当作用域边界会让记忆
-    绑在一个假项目上（P1.5a 观察项 4）。
     """
-    try:
-        ref = resolve_project(cwd)
-    except OSError:  # Windows 上个别被占用的路径 resolve 会抛
-        return None
-    return None if ref.is_loose else ref.project_id
-
-
-def _emit(context: str) -> None:
-    """输出注入块。``hookEventName`` 必带，否则宿主不认这个字段（评审 m-4）。"""
-    payload = {
-        "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": context,
-        }
-    }
-    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
-
-
-def _note(text: str) -> None:
-    """stderr 摘要。写不出去也不能影响主流程。"""
-    with suppress(OSError):
-        sys.stderr.write(text + "\n")
-        sys.stderr.flush()
-
-
-def _utf8_streams() -> None:
-    """Windows 默认代码页是 cp936，中文注入块会 ``UnicodeEncodeError``。
-
-    wrapper 里也设了 ``PYTHONIOENCODING``，这里再兜一层：hook 是宿主直接调起的
-    子进程，环境变量未必继承得到。
-    """
-    for stream in (sys.stdin, sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure is not None:
-            reconfigure(encoding="utf-8", newline="\n")
+    ref = resolve_for_host(cwd)
+    return None if ref is None else ref.project_id
 
 
 if __name__ == "__main__":

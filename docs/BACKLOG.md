@@ -74,6 +74,44 @@
 
 **b 段范围外清单**（明确不在本批做）：选宿主与写配置、指针块写进真实仓库、连续 5 天使用、`nebula report` 三项指标、阈值校准结论、负反馈是否降 `confidence`（要基线才能定降多少，现在拍数字就是猜）。
 
+## 当前批次：P1.5c A 档自动召回（目标：模型不用决定查不查）
+
+> 起因：P1.5b 接入后两天**自发 `recall` 为 0**（14 次调用全是用户显式要求触发）。
+> 指令块确实在注入路径上，模型读得到规则但不执行——B 档"靠指令驱动自觉"的假设被证伪。
+> 方案与两轮评审见 `.plans/`、`.reviews/`（过程稿，不入库）；契约已写进 §10.7。
+
+| ID | 类型 | 级别 | 事项 | 验收标准 | 状态 |
+|---|---|---|---|---|---|
+| C-1 | docs(design) | L | §10.7 A 档注入契约 + §9.4 前缀约束偏差登记 | 预算/去重/记账/fail-open/隐私/偏差逐条可查；不假装满足前缀约束 | done |
+| C-2 | feat(hook) | L | `prompt_submit`：按 prompt 自动召回 + 增量去重 + 内部消息过滤 | 同 prompt 两轮只记一次账；内部消息零副作用；任何异常退出 0 | done |
+| C-3 | feat(hook) | L | `session_start`：开场块 + 非查询选取路径 | pinned 与项目 top-N 按 `importance/heat`；private/他项目不出现；不记账 | done |
+| C-4 | test(hook) | L | 契约 / 记账 / 去重 / fail-open / 预算 / 可见性用例 | 36 条新用例，关键断言做变异测试（改坏必红） | done |
+| C-5 | chore | M | `scripts/coverage.py`：transcript 数分母的覆盖率统计 | 能给出分会话明细；"只有注入没有 transcript" 单独标出 | done |
+| C-6 | chore(host) | L | 宿主配置：两个 wrapper 脚本 + `settings.json` 换掉探针 | hook 由 Git Bash 绝对路径调起，库/解释器走绝对路径 | done（待重启生效） |
+| C-7 | test(e2e) | L | 实机连续使用的验收数据 | 覆盖率 ≥80%、每轮 ≤600 字符、`open→stdout` p95 <200ms、`feedback` ≥1 | **todo（阻塞在重启 + 真实使用）** |
+
+**已实测（2026-11-15，本机）**
+
+- 门禁：`ruff` 0 / `mypy --strict` 0（37 文件）/ `pytest` **301 passed**。
+- 单体耗时（真库副本，19 条记忆）：`prompt_submit` 注入 1 条 36ms（冷）、二轮 6ms；
+  `session_start` 开场 3 条 6–7ms。均远低于 200ms 门槛。
+- 去重：同一 prompt 第二轮不注入、`recall_count` 不涨、`injection_log` 落一行 `[]`。
+- 记账边界：变异成 `record=True` → 用例红；开场块改成记账 → 两轮会话即把 `recall_count`
+  推到 2（正是要防的污染）。
+- 覆盖率脚本在**上线前**的基线：58 轮 / 0 行 = 0.0%。这不是"没测出来"，是"确实一次没注入"。
+- 端到端（按宿主调用方式，Git Bash 绝对路径调 wrapper）：两条通道都退出 0，stderr 有摘要，
+  开场块按 `〔本项目〕` 正常渲染。
+
+**上线前待办**
+
+1. **重启 WorkBuddy**：hooks 配置不热加载（`/hooks` 面板审查或完整重启）；
+2. 重启后确认开场块真的进了上下文——`SessionStart` 走的是**纯文本 stdout**（宿主文档写
+   "stdout 追加到会话上下文"），若实测不生效就换回 `hookSpecificOutput` JSON，一个调用点的事；
+3. 用一天后跑 `python scripts/coverage.py --days 1` 填 C-7。
+
+**本批明确不做**：`Stop` 自动写入（§10.7 非目标 1）、`PostCompact` 清去重集（已知限制 2）、
+private 分区注入（已知限制 1）、会话累计预算的 12k 降级阶梯（等真实用量）。
+
 ## 审查记录（P1.5a，独立会话执行）
 
 原始报告 `.reviews/CODE-REVIEW-P1.5a-adapter-2026-11-11.md`（过程稿，不入库）。结论「修复后通过」，**C-1 / M-1 阻塞合并**。以下每条都有会红的用例或实跑输出。

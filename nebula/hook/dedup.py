@@ -37,18 +37,40 @@ def seen_ids(
     ``session_id`` 为空时，SQL 里的 ``session = NULL`` 不成立，只剩时间窗口生效：
     去重变弱（同一会话的旧条目可能被再注入一次），但不会误抑制。这个方向是有意的——
     少去重只是浪费一点 token，多去重会让该出现的记忆消失。
+
+    **两条查询而不是一条 `OR`**（审查 M-3）：`OR` 的另一支（`session`）上没有索引，
+    优化器只能 `SCAN injection_log` + `USE TEMP B-TREE FOR DISTINCT`，实测 300k 行
+    20.8ms 且随库线性增长——而这条查询每轮都跑。拆开后两支各走 `ix_injection_log_session`
+    与 `ix_injection_log_ts`，在 Python 侧取并集。
+
+    窗口加了上界 ``ts <= now``（审查 N-1）：没有上界时，任何"未来时间"的行会永久命中
+    去重集；测试里注入 `now` 与真实时钟不一致时就是这么被掩盖的。
     """
     stamp = fmt(now) if now is not None else now_ts()
     moment = parse_ts(stamp)
     if moment is None:  # pragma: no cover - stamp 由 fmt 生成，一定可解析
         return set()
     cutoff = fmt(moment - timedelta(seconds=window_seconds))
+
+    ids: set[str] = set()
+    if session_id is not None:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT je.value AS memory_id
+            FROM injection_log AS il, json_each(il.memory_ids) AS je
+            WHERE il.session = ?
+            """,
+            (session_id,),
+        ).fetchall()
+        ids.update(str(row["memory_id"]) for row in rows)
+
     rows = conn.execute(
         """
         SELECT DISTINCT je.value AS memory_id
         FROM injection_log AS il, json_each(il.memory_ids) AS je
-        WHERE il.session = ? OR (il.host = ? AND il.ts >= ?)
+        WHERE il.host = ? AND il.ts >= ? AND il.ts <= ?
         """,
-        (session_id, host, cutoff),
+        (host, cutoff, stamp),
     ).fetchall()
-    return {str(row["memory_id"]) for row in rows}
+    ids.update(str(row["memory_id"]) for row in rows)
+    return ids

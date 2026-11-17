@@ -120,7 +120,7 @@ def test_migrate_v1_to_v2_backfills_arbitration_slot(tmp_path: Path) -> None:
             (STAMP,),
         )
 
-        assert migrate(conn) == [2, 3, 4]
+        assert migrate(conn) == [2, 3, 4, 5]
         assert schema_version(conn) == CURRENT_SCHEMA_VERSION
         row = conn.execute(
             "SELECT scope, project_id, visibility, session_id FROM arbitration WHERE id = 'arb-1'"
@@ -152,7 +152,7 @@ def test_migrate_v2_to_v3_adds_lifecycle_and_backfills_events(tmp_path: Path) ->
         event_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(events)")}
         assert "scope" not in event_columns
 
-        assert migrate(conn) == [3, 4]
+        assert migrate(conn) == [3, 4, 5]
         row = conn.execute(
             "SELECT scope, visibility FROM events WHERE target = ?", (memory_id,)
         ).fetchone()
@@ -189,7 +189,7 @@ def test_migrate_v3_to_v4_adds_interface_tables(tmp_path: Path) -> None:
         assert "injection_log" not in names
         assert "feedback" not in names
 
-        assert migrate(conn) == [4]
+        assert migrate(conn) == [4, 5]
         names = {
             str(row["name"])
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -212,6 +212,37 @@ def test_migrate_v3_to_v4_adds_interface_tables(tmp_path: Path) -> None:
         assert migrate(conn) == []
     finally:
         conn.close()
+
+
+def test_migrate_v4_to_v5_adds_the_dedup_index(tmp_path: Path) -> None:
+    """P1.5c 审查 M-3：去重按 ``session`` 查，没索引就只能全表扫（300k 行 20.8ms/轮）。"""
+    path = tmp_path / "v4.db"
+    conn = connect(path)
+    try:
+        assert migrate(conn, target=4) == [1, 2, 3, 4]
+        assert "ix_injection_log_session" not in _index_names(conn)
+
+        assert migrate(conn) == [5]
+        assert "ix_injection_log_session" in _index_names(conn)
+        # 断言索引真的被用上；只看"索引存在"会被"建了但优化器不用"骗过
+        plan = " ".join(
+            str(row["detail"])
+            for row in conn.execute(
+                "EXPLAIN QUERY PLAN SELECT memory_ids FROM injection_log WHERE session = ?",
+                ("s-1",),
+            )
+        )
+        assert "SCAN injection_log" not in plan
+        assert migrate(conn) == []
+    finally:
+        conn.close()
+
+
+def _index_names(conn: sqlite3.Connection) -> set[str]:
+    return {
+        str(row["name"])
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
+    }
 
 
 def test_semantic_memory_cannot_be_hard_deleted(conn: sqlite3.Connection) -> None:

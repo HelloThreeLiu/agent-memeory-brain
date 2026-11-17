@@ -67,11 +67,13 @@ def run(
     单元用例走这条路）。它在**记账之前**被调用：写不出去的东西不该被记成"已注入"。
     """
     started = time.perf_counter()
-    prompt = strip_wrappers(payload.prompt)
-    internal, unknown_tag = internal_message(prompt)
+    # 判定要拿**原文**：包装上的 data-role 是"这条算不算用户消息"的依据，
+    # 先剥壳再判定就读不到了（复审 R2-2）
+    internal, unknown_tag = internal_message(payload.prompt)
     if internal:
         detail = "跳过·内部消息" if unknown_tag is None else f"跳过·未知内部标签 <{unknown_tag}>"
         return Outcome(None, line(detail))
+    prompt = strip_wrappers(payload.prompt)
     if not prompt:
         return Outcome(None, line("跳过·空消息"))
 

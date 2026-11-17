@@ -32,7 +32,7 @@ from pathlib import Path
 # 而"分母口径"必须与 hook 共用一份实现（审查 M-1），所以宁可加这一行。
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from nebula.hook.payload import internal_message, strip_wrappers
+from nebula.hook.payload import is_user_turn
 
 DEFAULT_DB = Path.home() / ".nebula" / "memory.db"
 DEFAULT_PROJECTS = Path.home() / ".workbuddy" / "projects"
@@ -54,9 +54,10 @@ def _message_text(record: dict[str, object]) -> str:
 def _user_turns(transcript: Path, *, since: float | None = None) -> int:
     """数 transcript 里**真实的** user turn。
 
-    跳过两类：宿主内部消息（与 hook 同一份判定），以及剥掉包装后什么都没留下的消息
-    （只有 `<system-reminder>` 样板，没有 `<user_query>`）。坏行直接跳过——统计工具
-    不该因为一行坏 JSON 罢工。
+    判定整条委托给 ``payload.is_user_turn``：内部通知（``<task-notification>``）、
+    宿主控制消息（``data-role="error-recovery"``）、剥壳后什么都没剩的样板都不算一轮。
+    分数口径只能有一份实现——两边各写一份，读数就会漂（复审 R2-2）。
+    坏行直接跳过：统计工具不该因为一行坏 JSON 罢工。
     """
     turns = 0
     with transcript.open(encoding="utf-8", errors="replace") as handle:
@@ -71,8 +72,7 @@ def _user_turns(transcript: Path, *, since: float | None = None) -> int:
                 continue
             if since is not None and not _not_before(record, since):
                 continue
-            text = strip_wrappers(_message_text(record))
-            if not text or internal_message(text)[0]:
+            if not is_user_turn(_message_text(record)):
                 continue
             turns += 1
     return turns

@@ -27,7 +27,13 @@ import pytest
 
 from nebula.core.timeutil import fmt
 from nebula.hook.db import HOOK_BUSY_TIMEOUT_MS, open_hook_database
-from nebula.hook.payload import Payload, internal_message, parse, strip_wrappers
+from nebula.hook.payload import (
+    Payload,
+    internal_message,
+    is_user_turn,
+    parse,
+    strip_wrappers,
+)
 from nebula.hook.prompt_submit import QUERY_MAX_CHARS, main, run
 from nebula.hook.render import LINE_MAX_CHARS, PROMPT_MAX_CHARS, render_prompt_block
 from nebula.recall.search import Hit
@@ -428,8 +434,60 @@ def test_strip_wrappers_keeps_plain_text_intact() -> None:
     assert strip_wrappers("  构建命令是什么  ") == "构建命令是什么"
     # 只有外壳、没有 user_query：保留里面的内容，不整段丢掉
     assert strip_wrappers("<system-reminder>x</system-reminder>") == "x"
-    wrapped = '<system-reminder a="1">t<user_query>真话</user_query></system-reminder>'
-    assert strip_wrappers(wrapped) == "真话"
+    # 壳里只有标签块（user_info 这类宿主样板）→ 认 user_query
+    tags_only = (
+        '<system-reminder data-role="user-context">'
+        "<user_info>ctx</user_info><user_query>真话</user_query></system-reminder>"
+    )
+    assert strip_wrappers(tags_only) == "真话"
+    # 壳里还有正文（不是只有标签块）→ 不认 user_query，保持原样（R2-1）
+    mixed = '<system-reminder a="1">前缀<user_query>真话</user_query></system-reminder>'
+    assert strip_wrappers(mixed) == "前缀<user_query>真话</user_query>"
+    # 前缀外壳：壳外还有正文（复审残余风险 3）
+    prefix = '<system-reminder data-role="user-context">ctx</system-reminder>真正的提问'
+    assert strip_wrappers(prefix) == "真正的提问"
+
+
+def test_user_query_tag_inside_prose_does_not_truncate() -> None:
+    """复审 R2-1：正文里**提到**这个标签时，不能把话截成标签里的内容。
+
+    这段文本既要去召回，又要落进 ``injection_log.query``——截错了两边都错，还不报错。
+    """
+    inline = "帮我看下这段代码 <user_query>foo</user_query> 有什么问题"
+    assert strip_wrappers(inline) == inline
+
+    twice = "对比 <user_query>a</user_query> 和 <user_query>b</user_query> 哪个好"
+    assert strip_wrappers(twice) == twice
+
+
+def test_control_wrapper_is_not_a_user_turn() -> None:
+    """复审 R2-2：``data-role="error-recovery"`` 是宿主自动续跑，不是用户说话。
+
+    实测这类消息剥壳后是一句英文样板：既会被当成一轮（分母多算），hook 也会拿它去召回。
+    """
+    control = (
+        '<system-reminder data-role="error-recovery">'
+        "Network error occurred, please continue</system-reminder>"
+    )
+
+    assert internal_message(control) == (True, None)
+    assert is_user_turn(control) is False
+    assert is_user_turn('<system-reminder data-role="user-context">x</system-reminder>') is True
+    assert is_user_turn("构建命令是什么") is True
+
+
+def test_control_wrapper_is_skipped_by_the_hook(invoke: Invoke, conn: sqlite3.Connection) -> None:
+    control = (
+        '<system-reminder data-role="error-recovery">'
+        "Network error occurred, please continue</system-reminder>"
+    )
+
+    code, out, err = invoke(_raw(control))
+
+    assert code == 0
+    assert out == ""
+    assert "跳过·内部消息" in err
+    assert _injections(conn) == []
 
 
 # -------------------------------------- C-1 / M-4：锁争用与账本故障

@@ -8,7 +8,8 @@
 
 所以 hook 自己组合连接，三条都必须有：
 
-1. ``busy_timeout`` 压到 300ms：拿不到锁就快速失败，让 fail-open 有机会说话；
+1. ``busy_timeout`` 压到 300ms，而且**在 ``connect()`` 里就给**——``journal_mode = WAL``
+   的切换同样要拿写锁，库还不是 WAL 时那一步也会等满 10s（复审残余风险 1）；
 2. ``set_progress_handler``：到点让 SQLite **中断当前语句**，而不是等它自己返回
    （busy_timeout 只管等锁，管不了慢查询）；
 3. 迁移前就把 1、2 装好——``open_database()`` 是先 connect 再 migrate，锁争用时
@@ -35,9 +36,8 @@ def open_hook_database(path: str | None, *, deadline_ms: int) -> sqlite3.Connect
 
     ``deadline_ms`` 从**调用这一刻**算起，与调用方的软上限同源，避免两处各算一套。
     """
-    conn = connect(resolve_db_path(path))
+    conn = connect(resolve_db_path(path), busy_timeout_ms=HOOK_BUSY_TIMEOUT_MS)
     deadline = time.monotonic() + deadline_ms / 1000
-    conn.execute(f"PRAGMA busy_timeout = {HOOK_BUSY_TIMEOUT_MS}")
 
     def _abort_when_late() -> int:
         # 返回非 0 让当前语句以 OperationalError("interrupted") 结束

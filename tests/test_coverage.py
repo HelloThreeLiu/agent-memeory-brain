@@ -60,6 +60,10 @@ def test_user_turns_skip_host_internal_messages(tmp_path: Path) -> None:
                     "<user_query>第二句</user_query></system-reminder>"
                 ),
                 _user("<task-notification><task-id>x</task-id><status>completed</status></task-notification>"),
+                _user(  # 复审 R2-2：宿主自动续跑，不是一轮
+                    '<system-reminder data-role="error-recovery">'
+                    "Network error occurred, please continue</system-reminder>"
+                ),
                 _assistant("好的"),
                 "not json",
             ]

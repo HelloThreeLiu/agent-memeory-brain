@@ -138,6 +138,22 @@ private 分区注入（已知限制 1）、会话累计预算的 12k 降级阶�
 真库（已迁移到 schema v5）按宿主方式跑 wrapper：注入 1 条 50ms、exit 0。
 `feedback` 仍为 0——提醒：注入块自带 id 是它唯一的自然触发点，用起来才有数据。
 
+### 复审（R2，同日，同一审查者）
+
+报告 `.reviews/CODE-REVIEW-P1.5c-hook-R2-2026-11-17.md`（过程稿，不入库）。结论
+「**修复后通过**」，首轮 15 条逐条复核通过；新增 2 条 Minor（R2-1 影响 C-7 读数，先修再用）。
+
+| 编号 | 级别 | 问题 | 处理 | 验证证据 |
+|---|---|---|---|---|
+| R2-1 | Minor | `<user_query>` 用子串 `search`：正文里**提到**这个标签（贴 transcript、讨论 payload）会把话截成标签里的内容，截断后的文本既去召回又落 `injection_log.query` | 只在"去掉标签后没有别的正文"时才采纳 `<user_query>`（`_only_tag_blocks` 闸） | `test_user_query_tag_inside_prose_does_not_truncate`：单标签与双标签两句都原样返回；变异：去掉闸 → 红 |
+| R2-2 | Minor | 分母仍多算宿主控制消息：`data-role="error-recovery"` 剥壳后是英文样板句，被当成一轮（实测 1 条就让 6b7c2603 显示 50%、合计 75%） | 统一判定 `payload.is_user_turn`：`data-role` 不是 `user-context` 一律不算一轮，hook 也跳过；`coverage.py` 只用这一个函数 | `test_control_wrapper_is_not_a_user_turn` / `test_control_wrapper_is_skipped_by_the_hook`；实测分母 223 → **208**，近 2 天读数 4/4 = **100%**（原 75%） |
+
+顺带把复审的残余风险 1 也修了：`connect()` 加可选 `busy_timeout_ms`，从建连接那一刻就生效
+（`journal_mode = WAL` 的切换也要拿写锁，库还不是 WAL 时会等满 10s）。
+
+**复验（R2 后）**：`ruff` 0 / `mypy` 0 / `pytest` **349 passed**。残余风险 2（migrate 耗时）
+与 3（"前缀包装 + 正文在壳外"）已分别登记为"约 10M 行才撞线"与"已支持前缀形态"。
+
 ## 审查记录（P1.5a，独立会话执行）
 
 原始报告 `.reviews/CODE-REVIEW-P1.5a-adapter-2026-11-11.md`（过程稿，不入库）。结论「修复后通过」，**C-1 / M-1 阻塞合并**。以下每条都有会红的用例或实跑输出。

@@ -26,12 +26,19 @@ def resolve_db_path(explicit: str | None = None) -> Path:
     return Path.home() / ".nebula" / "memory.db"
 
 
-def connect(path: str | Path) -> sqlite3.Connection:
+def connect(path: str | Path, *, busy_timeout_ms: int = 10000) -> sqlite3.Connection:
+    """建连接。``busy_timeout_ms`` 只有 hook 会调小——它等不起（见 ``nebula/hook/db.py``）。
+
+    这个参数必须在**这里**就能给：``journal_mode = WAL`` 的切换也要拿写锁，库还不是 WAL
+    时（首次建库）那一步照样会等满 ``busy_timeout``，之后再改就已经晚了（复审残余风险 1）。
+    """
     target = str(path)
     if target != ":memory:":
         Path(target).expanduser().parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(target, isolation_level=None, timeout=10.0)
+    conn = sqlite3.connect(target, isolation_level=None, timeout=busy_timeout_ms / 1000)
     conn.row_factory = sqlite3.Row
+    # 先在 sqlite3 层与 PRAGMA 层都设好，再做任何要锁的动作
+    conn.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)}")
     # 只在还不是 WAL 时才切：切换日志模式要拿写锁，多进程同时切会撞出
     # "attempt to write a readonly database"（P4 的 daemon + shim 同样会遇到）
     mode = conn.execute("PRAGMA journal_mode").fetchone()
@@ -39,7 +46,6 @@ def connect(path: str | Path) -> sqlite3.Connection:
         conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA busy_timeout = 10000")
     return conn
 
 

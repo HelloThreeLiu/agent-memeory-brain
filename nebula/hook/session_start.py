@@ -12,29 +12,31 @@
 
 也**不查去重集**：resume / compact 之后上下文里的内容可能已经没了，按 per-session
 去重抑制重注入会让开场块彻底消失。
+
+顺序上有一条是审查换来的（M-4 / 剩余风险 1）：**先写 stdout、后落日志**。开场块只有
+真的输出成功才允许进 `injection_log`，否则它会被去重集记成"本会话已注入"——而模型
+根本没看到，那几条最重要的记忆就永久静默了。
 """
 
 from __future__ import annotations
 
 import argparse
+import sqlite3
 import sys
 import time
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
 from datetime import datetime
 
 from nebula.adapter.project import resolve_for_host
-from nebula.core.timeutil import fmt, now_ts
+from nebula.core.timeutil import fmt, now_ts, parse_ts
 from nebula.core.viewer import Viewer
+from nebula.hook.common import HOST_DEFAULT, Outcome, event_notice
+from nebula.hook.db import open_hook_database
 from nebula.hook.payload import Payload, parse
-from nebula.hook.render import render_session_block
+from nebula.hook.render import Block, render_session_block
 from nebula.hook.summary import emit_plain, failure, line, note, utf8_streams
 from nebula.recall.core import CORE_PINNED, CORE_PROJECT, core_memories
-from nebula.store.db import open_database
 from nebula.store.write_service import WriteService
-
-#: 与 MCP / prompt_submit 的 ``--host`` 同名，否则 ``scope=host`` 的记忆两边看到的不一样
-HOST_DEFAULT = "workbuddy"
 
 #: 自身耗时软上限（与 prompt_submit 同口径）
 SOFT_DEADLINE_MS = 5000
@@ -42,11 +44,8 @@ SOFT_DEADLINE_MS = 5000
 #: ``query`` 的固定前缀；``<source>`` 取 ``startup`` / ``resume`` / ``clear``
 QUERY_PREFIX = "session-start"
 
-
-@dataclass(frozen=True)
-class Outcome:
-    context: str | None
-    summary: str
+#: 本入口服务的事件名（N-9）
+EVENT = "SessionStart"
 
 
 def run(
@@ -55,11 +54,12 @@ def run(
     *,
     host: str = HOST_DEFAULT,
     now: datetime | None = None,
+    deliver: Callable[[str], bool] | None = None,
 ) -> Outcome:
-    """选内容、渲染、落日志。**异常一律上抛**，由 :func:`main` 兜成 fail-open。"""
+    """选内容、渲染、输出、落日志。**异常一律上抛**，由 :func:`main` 兜成 fail-open。"""
     started = time.perf_counter()
     stamp = fmt(now) if now is not None else now_ts()
-    conn = open_database(db)
+    conn = open_hook_database(db, deadline_ms=SOFT_DEADLINE_MS)
     try:
         ref = resolve_for_host(payload.cwd)
         # 不传 viewer_session：与 prompt_submit 同口径（private 分区不注入，§10.7 已知限制 1）
@@ -77,6 +77,47 @@ def run(
         elapsed_ms = (time.perf_counter() - started) * 1000
         if elapsed_ms > SOFT_DEADLINE_MS:
             return Outcome(None, line(f"跳过·超时 {elapsed_ms:.0f}ms"))
+
+        delivered = True
+        if block.text and deliver is not None:
+            delivered = deliver(block.text)
+        if delivered:
+            _settle(
+                conn,
+                block=block,
+                payload=payload,
+                project_id=viewer.project_id,
+                host=host,
+                stamp=stamp,
+                elapsed_ms=elapsed_ms,
+            )
+    finally:
+        conn.close()
+
+    notice = event_notice(payload.event, EVENT)
+    if block.text:
+        detail = "输出失败·未落日志" if not delivered else f"开场 {len(block.hits)} 条"
+        detail = f"{detail} {elapsed_ms:.0f}ms"
+    else:
+        detail = f"无内容 {elapsed_ms:.0f}ms"
+    if notice is not None:
+        detail = f"{notice}·{detail}"
+    return Outcome(block.text or None, line(detail))
+
+
+def _settle(
+    conn: sqlite3.Connection,
+    *,
+    block: Block,
+    payload: Payload,
+    project_id: str | None,
+    host: str,
+    stamp: str,
+    elapsed_ms: float,
+) -> None:
+    """只落 ``injection_log``（不记账），失败只写 stderr。"""
+    moment = parse_ts(stamp)
+    try:
         WriteService(conn).log_injection(
             query=f"{QUERY_PREFIX}:{payload.source or 'unknown'}",
             memory_ids=[hit.id for hit in block.hits],
@@ -84,16 +125,12 @@ def run(
             top_k=CORE_PINNED + CORE_PROJECT,
             host=host,
             session_id=payload.session_id,
-            project_id=viewer.project_id,
+            project_id=project_id,
             elapsed_ms=round(elapsed_ms, 3),
+            now=moment,
         )
-    finally:
-        conn.close()
-
-    detail = f"开场 {len(block.hits)} 条 {elapsed_ms:.0f}ms"
-    if not block.text:
-        detail = f"无内容 {elapsed_ms:.0f}ms"
-    return Outcome(block.text or None, line(detail))
+    except Exception as exc:
+        note(failure(exc))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -113,9 +150,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     utf8_streams()
     args, _ = build_parser().parse_known_args(argv)
     try:
-        outcome = run(parse(sys.stdin.read()), args.db, host=args.host)
-        if outcome.context:
-            emit_plain(outcome.context)
+        outcome = run(
+            parse(sys.stdin.read()),
+            args.db,
+            host=args.host,
+            deliver=emit_plain,
+        )
     except Exception as exc:
         note(failure(exc))
         return 0

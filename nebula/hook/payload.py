@@ -4,10 +4,17 @@ WorkBuddy 每次触发 hook 都把一段 JSON 塞进 stdin。这里只取四件�
 （``permission_mode`` / ``model`` / ``generation_id`` / ``agent_type``）刻意不解析：
 hook 的判定不该依赖宿主实现细节，取多了等于把自己绑死在某个版本上。
 
-一个必须处理的意外（2026-11-13 探针实测）：**宿主自身的内部消息也走
-``UserPromptSubmit``**。后台任务完成的通知，``prompt`` 是
-``<task-notification><task-id>…``。不拦掉的话，每次任务通知都要召回一次——
-白烧 token，还会把覆盖率的分母搅乱。
+三个必须处理的意外：
+
+1. **宿主自身的内部消息也走 ``UserPromptSubmit``**（2026-11-13 探针实测）：后台任务
+   完成的通知，``prompt`` 是 ``<task-notification><task-id>…``。不拦掉的话每次任务通知
+   都要召回一次——白烧 token，还会把覆盖率的分母搅乱。
+2. **包装标签不是内部消息**（P1.5c 审查 N-2）：宿主在 transcript 里给每条 user 消息套
+   ``<system-reminder data-role="user-context">…<user_query>真正的话</user_query>``，
+   而 hook 目前收到的是干净原文。两者随时可能变，所以包装标签要**剥掉后继续召回**，
+   不能当成内部消息跳过——否则某天宿主换了传法，召回会整轮失效，只剩一行 stderr。
+3. 两张表必须分开（:data:`WRAPPER_TAGS` / :data:`INTERNAL_TAGS`），否则"剥掉"与"跳过"
+   这两种完全不同的处置会被混成一个。
 """
 
 from __future__ import annotations
@@ -16,12 +23,27 @@ import json
 import re
 from dataclasses import dataclass
 
-#: 宿主内部消息的标签名单。可扩展：宿主升级可能新增标签，命中名单外的
-#: ``<`` 开头消息时调用方要记一行 stderr，事后才好补进来。
+#: 内部消息标签：命中即**跳过**（不召回、不记账、不注入）
 INTERNAL_TAGS: frozenset[str] = frozenset({"task-notification"})
+
+#: 包装标签：**剥掉**外壳后按用户原文继续处理
+WRAPPER_TAGS: frozenset[str] = frozenset({"system-reminder"})
 
 #: 只认"整条消息以标签开头"。在正文里搜 ``<`` 会把用户贴的 HTML/XML 误杀。
 _TAG_HEAD = re.compile(r"^<\s*([A-Za-z][A-Za-z0-9_:.-]*)")
+
+#: 成对出现的包装块。**必须整条包住**（``$`` 锚）才剥：只去掉外壳、保留里面的内容，
+#: 否则会把用户原话一起删掉。``</tag>`` 与开标签同名，大小写不敏感。
+_WRAPPER_BLOCK = re.compile(
+    r"^<\s*(?P<tag>[A-Za-z][A-Za-z0-9_:.-]*)\b[^>]*>(?P<body>.*)</\s*(?P=tag)\s*>\s*$",
+    re.S | re.I,
+)
+
+#: 宿主把用户原话放在这个标签里
+_USER_QUERY_BLOCK = re.compile(r"<user_query>(.*?)</user_query>", re.S | re.I)
+
+#: 剥包装的层数上限：防畸形输入把这里变成死循环
+_MAX_WRAPPERS = 4
 
 
 @dataclass(frozen=True)
@@ -52,20 +74,40 @@ def parse(raw: str) -> Payload:
     )
 
 
+def strip_wrappers(prompt: str) -> str:
+    """剥掉宿主的包装标签，返回用户原文（拿它去召回，不要拿原始 prompt）。
+
+    处理两种形态：整条被 ``<system-reminder …>…</system-reminder>`` 包住（可以套多层），
+    以及用户原话在 ``<user_query>…</user_query>`` 里。剥完是空串说明这条消息只有宿主
+    样板，调用方按空消息跳过。
+    """
+    text = prompt.strip()
+    for _ in range(_MAX_WRAPPERS):
+        match = _WRAPPER_BLOCK.match(text)
+        if match is None or match.group("tag").lower() not in WRAPPER_TAGS:
+            break
+        text = match.group("body").strip()
+    found = _USER_QUERY_BLOCK.search(text)
+    if found is not None:
+        text = found.group(1).strip()
+    return text
+
+
 def internal_message(prompt: str) -> tuple[bool, str | None]:
     """判断是否为宿主内部消息，返回 ``(是否内部, 需要记 stderr 的未知标签名)``。
 
+    **先剥包装再看开头**（N-2）：只有剥完之后仍以标签开头的才是宿主拼的消息。
     三种返回值对应三种行为（§10.7）：
 
     - ``(False, None)``：用户消息，正常召回；
     - ``(True, None)``：已知内部消息，**静默**跳过（不召回、不记账、不注入）；
     - ``(True, "xxx")``：以标签开头但不在名单里，跳过并记 stderr——宿主升级后补
-      名单全靠这一行；静默跳过只会让人以为 hook 坏了。
+      名单全靠这一行；静默跳过只会让人以为 hook 坏了。未闭合的包装标签也落在这里。
     """
-    head = prompt.lstrip()
-    if not head.startswith("<"):
+    text = strip_wrappers(prompt)
+    if not text.startswith("<"):
         return False, None
-    match = _TAG_HEAD.match(head)
+    match = _TAG_HEAD.match(text)
     if match is None:
         # ``<3`` 这类不是标签，按用户原文处理
         return False, None

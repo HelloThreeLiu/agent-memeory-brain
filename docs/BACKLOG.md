@@ -104,13 +104,39 @@
 
 **上线前待办**
 
-1. **重启 WorkBuddy**：hooks 配置不热加载（`/hooks` 面板审查或完整重启）；
-2. 重启后确认开场块真的进了上下文——`SessionStart` 走的是**纯文本 stdout**（宿主文档写
-   "stdout 追加到会话上下文"），若实测不生效就换回 `hookSpecificOutput` JSON，一个调用点的事；
-3. 用一天后跑 `python scripts/coverage.py --days 1` 填 C-7。
+- ~~重启 WorkBuddy~~：已完成，2026-11-17 审查会话确认**开场块确实进了上下文**
+  （`[记忆|会话开始] 项目 agent-memeory-brain` + 4 条）——`SessionStart` 的纯文本 stdout 通道成立。
+- 覆盖率还差数据：近 2 天只有 3 轮（2 行注入，66.7%），样本太小，C-7 继续等真实使用。
 
 **本批明确不做**：`Stop` 自动写入（§10.7 非目标 1）、`PostCompact` 清去重集（已知限制 2）、
 private 分区注入（已知限制 1）、会话累计预算的 12k 降级阶梯（等真实用量）。
+
+## 审查记录（P1.5c，独立会话执行，2026-11-17）
+
+原始报告 `.reviews/CODE-REVIEW-P1.5c-hook-2026-11-17.md`（过程稿，不入库）。结论
+「**打回修复**」，C-1 阻塞合并、M-1/M-2 阻塞 C-7 验收。15 条全部处理，逐条证据如下。
+
+| 编号 | 级别 | 问题 | 处理 | 验证证据 |
+|---|---|---|---|---|
+| **C-1** | Critical | 另一连接持写锁时 hook 阻塞 **55.3s**（`busy_timeout=10s` × `_BEGIN_ATTEMPTS=5` + 两个写事务），三条承诺全破 | 新增 `nebula/hook/db.py`：hook 自己 connect+migrate，`busy_timeout` 压到 **300ms**，并在迁移**之前**装 progress handler 到点中断；记账与日志合并成一个事务 | 持写锁实测 **2.6s** 返回（旧 55s），stdout 仍有注入块；`test_write_lock_does_not_stall_the_hook_nor_drop_the_injection`；变异：busy_timeout 改回 10000 → 红 |
+| M-1 | Major | 覆盖率分母含宿主内部通知（实测 318 轮里 97 轮是 `<task-notification>`），80% 门槛会假红 | 脚本直接 import `nebula.hook.payload` 的两个函数，不写第二份正则 | 新增 6 条 `tests/test_coverage.py`；含 2 轮真实 + 1 轮内部通知的 transcript 数出 2 |
+| M-2 | Major | stdout 管道关闭时退出码 **120**（CPython 退出时二次 flush 失败） | `_write` 失败时把 `sys.stdout` 换成 `StringIO`，并**不记账**；顺带兜住 `utf8_streams()` 在 fd 已关闭时抛的 `EBADF` | 子进程 `os.close(1)` 实测 exit **0**（修复前 120），stderr 有「输出失败·未记账」；变异：去掉置换 → 红 |
+| M-3 | Major | 去重每轮全表扫 `injection_log`（100k 6.4ms / 300k 20.8ms） | schema **v5** 加 `ix_injection_log_session (session, ts)`；去重拆成两条各自可走索引的查询 | `EXPLAIN` 两条都是 `SEARCH … USING INDEX`；100k 行 `seen_ids` p50 **0.196ms**；`test_migrate_v4_to_v5…` 断言无 `SCAN` |
+| M-4 | Major | 记账/落日志失败会连带丢掉本轮注入（块已渲染、stdout 为空） | `_settle` 包 try/except 只写 stderr；输出改为**先 emit 后记账** | `test_accounting_failure_keeps_the_block`（打桩 `log_injection` 抛错，stdout 仍有块）；变异：去掉 try/except → 红 |
+| N-1 | Minor | `log_injection` 未传 `now`，一轮两个时钟；去重窗口无上界 | 两处补 `now=parse_ts(stamp)`；窗口加 `ts <= now` | `test_log_row_uses_the_injected_now` 断言日志 ts == T0 |
+| N-2 | Minor | 未知 `<tag>` 一律跳过；宿主若改成传包装后的原文，召回整轮失效 | 分两张表：`WRAPPER_TAGS` 剥壳继续召回（只剥整条包住的外壳，保留内容），`INTERNAL_TAGS` 才跳过 | `test_wrapped_prompt_is_unwrapped_before_recall`：带 `<system-reminder>` 的消息仍注入，落库 query 是用户原话 |
+| N-3 | Minor | `resolve_for_host(None)` 回落进程 cwd，可能记到别的仓库 | 显式返回 `None`（= 没有项目身份） | `test_host_scope_drops_loose_projects` + 现有 project 用例 |
+| N-4 | Minor | 预算"逐条 break"不是最优装箱 | 不改行为，docstring 写明这是有意的（保留分数最高的前 k 条） | — |
+| N-5 | Minor | 尾注把 top_k 挤掉也算成"按长度截断" | 改为「（另有 N 条未列出）」 | 相关断言同步 |
+| N-6 | Minor | 文档 `AUTO_TOP_K` / 代码 `PROMPT_TOP_K` 分叉 | 统一到代码命名（文档 §10.7 表格改 `PROMPT_*` / `SESSION_MAX_CHARS` / `LINE_MAX_CHARS`） | 文档与 `render.py` 常量逐项对齐 |
+| N-7 | Minor | 覆盖率脚本无用例；`stat` 未兜错；`--days` 只看 mtime | 新增 `tests/test_coverage.py`（6 条）；`OSError` 跳过；`--days` 改按轮次 `timestamp` 筛 | 6 条用例全绿 |
+| N-8 | Minor | `core_memories` 没进 16 格可见性矩阵 | 矩阵参数化到两个入口（pinned 条目覆盖全部六个分区） | 新增 30 格参数化用例 |
+| N-9 | Nit | `Outcome` / `HOST_DEFAULT` 各写一遍；`Payload.event` 未用 | 抽 `nebula/hook/common.py`；事件名不匹配只提示不跳过（跳过会让通道静默失效） | 两入口共用；摘要有「事件名不匹配」 |
+| N-10 | Nit | 记账与注入日志两个事务，中间崩溃留不一致 | 合并成一个事务（与 C-1③ 同一处） | C-1 的用例覆盖；`_settle` 单事务 |
+
+**修复后复验（2026-11-17）**：`ruff` 0 / `mypy --strict` 0（39 文件）/ `pytest` **346 passed**。
+真库（已迁移到 schema v5）按宿主方式跑 wrapper：注入 1 条 50ms、exit 0。
+`feedback` 仍为 0——提醒：注入块自带 id 是它唯一的自然触发点，用起来才有数据。
 
 ## 审查记录（P1.5a，独立会话执行）
 

@@ -21,6 +21,7 @@ from nebula.core.viewer import (
     scope_predicate,
     visibility_predicate,
 )
+from nebula.recall.core import core_memories
 from nebula.recall.detail import expand
 from nebula.recall.explain import explain
 from nebula.recall.search import recall
@@ -245,6 +246,33 @@ def test_sql_predicate_agrees_with_deny_reason(
         is not None
     )
     assert hit is expected, f"{viewer_id} 看 {name}：SQL 说 {hit}，deny_reason 说 {expected}"
+
+
+@pytest.mark.parametrize("name,spec", _PARTITIONS, ids=[item[0] for item in _PARTITIONS])
+@pytest.mark.parametrize("viewer_id,viewer", _VIEWERS, ids=[item[0] for item in _VIEWERS])
+def test_core_selection_agrees_with_deny_reason(
+    conn: sqlite3.Connection,
+    write: Callable[..., WriteResult],
+    name: str,
+    spec: dict[str, object],
+    viewer_id: str,
+    viewer: Viewer,
+) -> None:
+    """开场块的选取路径也要过同一张矩阵（P1.5c 审查 N-8）。
+
+    它**看不到 prompt，也没人会去核对内容**，所以谓词以后一改、漏了这条路径，
+    没有任何使用迹象会提醒人——只有这张矩阵能报警。用 pinned 条目让"核心"分支
+    覆盖全部六个分区（非 pinned 的只会从本项目分区里出）。
+    """
+    memory_id = write(f"第 {name} 分区的置顶内容", pinned=True, **spec).id
+    row = conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+    assert row is not None
+    expected = deny_reason(row, viewer) is None
+
+    selected = memory_id in {hit.id for hit in core_memories(conn, viewer)}
+    assert selected is expected, (
+        f"{viewer_id} 看 {name}：开场块说 {selected}，deny_reason 说 {expected}"
+    )
 
 
 def test_loose_recall_does_not_leak_other_partitions(

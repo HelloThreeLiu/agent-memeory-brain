@@ -146,6 +146,10 @@ def _fit_lines(
     ``total`` 是"本来有多少条"，与 ``chunks`` 的长度可以不等（prompt 块只渲染 top_k，
     但"另有 N 条"要算上 top_k 之外的）。判定用的是 ``build`` 出来的**最终文本长度**，
     不是行长度之和——尾注与"另有 N 条"也算预算。
+
+    **这是"首次适配"而不是最优装箱**（审查 N-4）：某条塞不下就停，后面更短的条目没有
+    机会补位。这样换来的是一旦预算变化，保留的永远是**分数最高的前 k 条**，而不是"长度
+    最合适的一批"——开场块宁可少一条，也不要乱序。
     """
     lines: list[str] = []
     taken = 0
@@ -163,6 +167,7 @@ def _fit_lines(
 def _join(header: str, lines: Sequence[str], dropped: int, footer: str) -> str:
     body = [header, *lines]
     if dropped:
-        body.append(f"（另有 {dropped} 条未列出，按长度上限截断）")
+        # 只说"未列出"：被 top_k 挤掉与被预算挤掉是两回事，写死一个原因会误导排障（N-5）
+        body.append(f"（另有 {dropped} 条未列出）")
     body.append(footer)
     return "\n".join(body)

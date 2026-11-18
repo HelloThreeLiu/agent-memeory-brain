@@ -18,29 +18,48 @@ BEGIN = "<!-- nebula:begin -->"
 END = "<!-- nebula:end -->"
 
 
-def render_block() -> str:
+def render_block(*, auto_injection: bool = False) -> str:
     """指针块正文。
+
+    **两种变体，差别只在"要不要让模型自己去查"**：
+
+    - ``auto_injection=False``（默认，B 档宿主）：写"先调 ``recall``"——没有 hook 时，
+      不主动查就等于没有记忆；
+    - ``auto_injection=True``（A 档宿主）：写"召回是自动的"，**并且不出现工具名**。
+      A 档每轮都注入，再让模型主动查一遍就是双重检索：同一批记忆进两次上下文，
+      白烧 token，还会把去重集和指标搅乱（P1.5c 评审 §9-2）。
+
+    默认必须是 B 档那一版：别的宿主可能只接了 MCP，照着"自动注入"写会让他们干脆不查。
 
     用命令式措辞（§10.5：比"你可以…"有效），并且刻意**不写工具命名空间**：
     Claude Code 是 ``mcp__nebula__remember``、别的宿主又是另一套前缀，写死一个
     就会在另一个宿主上指引错。只给工具名，让宿主自己补前缀。
     """
-    return "\n".join(
-        [
-            BEGIN,
-            "## 记忆库（Nebula）",
+    lines = [BEGIN, "## 记忆库（Nebula）", ""]
+    if auto_injection:
+        lines += [
+            "你有跨会话的长期记忆库，通过 nebula 的 MCP 工具访问。**召回是自动的**：宿主每轮",
+            "会把相关记忆直接注入上下文，会话开场还有一块项目核心，不需要你自己检索。规则：",
             "",
+            "1. 定下结论、被纠正、学到可复用的东西时调 `remember`；用户本人明确下的结论用"
+            ' `assertion_type="decision"`。',
+            "2. 注入内容里带 `|未验证` 的是推测，不能当事实用。",
+            '3. 某条记错了调 `feedback(id, kind="wrong")`，不要自己改写正文。',
+            "4. 没看到相关记忆就照实说没查到，不要编造；要看单条来历用 `expand <id>`。",
+        ]
+    else:
+        lines += [
             "你有跨会话的长期记忆库，通过 nebula 的 MCP 工具访问。规则：",
             "",
             "1. 会话开始或接到新任务时，先调 `recall`：查询用当前任务的原话，不要改写。",
             "2. 定下结论、被纠正、学到可复用的东西时调 `remember`；用户本人明确下的结论用"
-            " `assertion_type=\"decision\"`。",
+            ' `assertion_type="decision"`。',
             "3. 召回结果里带 `|未验证` 的是推测，不能当事实用。",
-            "4. 某条记错了调 `feedback(id, kind=\"wrong\")`，不要自己改写正文。",
+            '4. 某条记错了调 `feedback(id, kind="wrong")`，不要自己改写正文。',
             "5. 没召回到就不要编造记忆内容，直接说没查到。",
-            END,
         ]
-    )
+    lines.append(END)
+    return "\n".join(lines)
 
 
 def _read(path: Path) -> tuple[str, str]:
@@ -65,9 +84,13 @@ def _write(path: Path, text: str, newline: str) -> None:
         handle.write(payload)
 
 
-def install(path: Path) -> str:
-    """写入或更新指针块。返回 ``created`` / ``appended`` / ``updated`` / ``unchanged``。"""
-    block = render_block()
+def install(path: Path, *, auto_injection: bool = False) -> str:
+    """写入或更新指针块。返回 ``created`` / ``appended`` / ``updated`` / ``unchanged``。
+
+    ``auto_injection`` 决定装哪一版（见 :func:`render_block`）：接入了 A 档 hook 的宿主
+    传 ``True``，否则保持默认，别让只有 MCP 的宿主以为召回是自动的。
+    """
+    block = render_block(auto_injection=auto_injection)
     text, newline = _read(path)
     exists = path.is_file()
 

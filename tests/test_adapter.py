@@ -170,3 +170,33 @@ def test_render_block_does_not_pin_a_namespace() -> None:
     block = render_block()
     assert "mcp__nebula__" not in block
     assert "`recall`" in block and "`remember`" in block and "feedback(" in block
+
+
+def test_render_block_has_an_a_tier_variant() -> None:
+    """A 档宿主不能再让模型自己 recall：每轮都注入了，再查一遍是双重检索（§9-2）。
+
+    A 档变体里连工具名都不出现——写了"别调 recall"模型仍会顺手调一次。
+    """
+    b_block = render_block()
+    a_block = render_block(auto_injection=True)
+
+    assert "先调 `recall`" in b_block
+    assert "`recall`" not in a_block
+    assert "召回是自动的" in a_block
+    assert "`remember`" in a_block and "feedback(" in a_block and "expand" in a_block
+
+
+def test_install_switches_between_variants(tmp_path: Path) -> None:
+    target = tmp_path / "AGENTS.md"
+    target.write_text("# 标题\n", encoding="utf-8")
+
+    assert install(target, auto_injection=True) == "appended"
+    text = target.read_text(encoding="utf-8")
+    assert "召回是自动的" in text and "`recall`" not in text
+
+    # 换回 B 档：替换同一个块，不叠第二份
+    assert install(target) == "updated"
+    text = target.read_text(encoding="utf-8")
+    assert "先调 `recall`" in text
+    assert text.count(BEGIN) == 1 and text.count(END) == 1
+    assert install(target) == "unchanged"

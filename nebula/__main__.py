@@ -405,6 +405,10 @@ def _cmd_status(args: argparse.Namespace) -> int:
         ).fetchone()[0]
         pinned = conn.execute("SELECT COUNT(*) FROM memories WHERE pinned = 1").fetchone()[0]
         print(f"回收站：{recycled} · 置顶：{pinned}")
+        # events 是只增不删的审计底账（§10.7 的决策）。不清它，就得让它"在长"这件事
+        # 可见——否则三年后才发现库里多了一张千万行的表
+        events = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        print(f"审计事件：{events}")
     finally:
         conn.close()
     return 0

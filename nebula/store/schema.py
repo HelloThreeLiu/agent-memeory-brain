@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 
 
 @dataclass(frozen=True)
@@ -314,9 +314,18 @@ _V4_INTERFACE: tuple[str, ...] = (
 )
 
 
+#: v5（P1.5c 审查 M-3）：A 档每轮都要查 ``injection_log`` 做增量去重，而 ``session``
+#: 上没有索引——带 ``OR`` 的查询只能全表扫描（实测 300k 行 20.8ms，且每轮都跑）。
+#: 复合索引把 ``(session, ts)`` 一起覆盖：会话侧走前缀，host 侧仍走 ``ix_injection_log_ts``。
+_V5_DEDUP_INDEX: tuple[str, ...] = (
+    "CREATE INDEX IF NOT EXISTS ix_injection_log_session ON injection_log (session, ts)",
+)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(version=1, name="p0-base", statements=_P0_STATEMENTS),
     Migration(version=2, name="arbitration-slot", statements=_V2_ARBITRATION_SLOT),
     Migration(version=3, name="lifecycle", statements=_V3_LIFECYCLE),
     Migration(version=4, name="interface", statements=_V4_INTERFACE),
+    Migration(version=5, name="dedup-index", statements=_V5_DEDUP_INDEX),
 )

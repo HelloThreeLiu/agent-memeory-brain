@@ -74,6 +74,86 @@
 
 **b 段范围外清单**（明确不在本批做）：选宿主与写配置、指针块写进真实仓库、连续 5 天使用、`nebula report` 三项指标、阈值校准结论、负反馈是否降 `confidence`（要基线才能定降多少，现在拍数字就是猜）。
 
+## 当前批次：P1.5c A 档自动召回（目标：模型不用决定查不查）
+
+> 起因：P1.5b 接入后两天**自发 `recall` 为 0**（14 次调用全是用户显式要求触发）。
+> 指令块确实在注入路径上，模型读得到规则但不执行——B 档"靠指令驱动自觉"的假设被证伪。
+> 方案与两轮评审见 `.plans/`、`.reviews/`（过程稿，不入库）；契约已写进 §10.7。
+
+| ID | 类型 | 级别 | 事项 | 验收标准 | 状态 |
+|---|---|---|---|---|---|
+| C-1 | docs(design) | L | §10.7 A 档注入契约 + §9.4 前缀约束偏差登记 | 预算/去重/记账/fail-open/隐私/偏差逐条可查；不假装满足前缀约束 | done |
+| C-2 | feat(hook) | L | `prompt_submit`：按 prompt 自动召回 + 增量去重 + 内部消息过滤 | 同 prompt 两轮只记一次账；内部消息零副作用；任何异常退出 0 | done |
+| C-3 | feat(hook) | L | `session_start`：开场块 + 非查询选取路径 | pinned 与项目 top-N 按 `importance/heat`；private/他项目不出现；不记账 | done |
+| C-4 | test(hook) | L | 契约 / 记账 / 去重 / fail-open / 预算 / 可见性用例 | 36 条新用例，关键断言做变异测试（改坏必红） | done |
+| C-5 | chore | M | `scripts/coverage.py`：transcript 数分母的覆盖率统计 | 能给出分会话明细；"只有注入没有 transcript" 单独标出 | done |
+| C-6 | chore(host) | L | 宿主配置：两个 wrapper 脚本 + `settings.json` 换掉探针 | hook 由 Git Bash 绝对路径调起，库/解释器走绝对路径 | done（待重启生效） |
+| C-7 | test(e2e) | L | 实机连续使用的验收数据 | 覆盖率 ≥80%、每轮 ≤600 字符、`open→stdout` p95 <200ms、`feedback` ≥1 | **todo（阻塞在重启 + 真实使用）** |
+
+**已实测（2026-11-15，本机）**
+
+- 门禁：`ruff` 0 / `mypy --strict` 0（37 文件）/ `pytest` **301 passed**。
+- 单体耗时（真库副本，19 条记忆）：`prompt_submit` 注入 1 条 36ms（冷）、二轮 6ms；
+  `session_start` 开场 3 条 6–7ms。均远低于 200ms 门槛。
+- 去重：同一 prompt 第二轮不注入、`recall_count` 不涨、`injection_log` 落一行 `[]`。
+- 记账边界：变异成 `record=True` → 用例红；开场块改成记账 → 两轮会话即把 `recall_count`
+  推到 2（正是要防的污染）。
+- 覆盖率脚本在**上线前**的基线：58 轮 / 0 行 = 0.0%。这不是"没测出来"，是"确实一次没注入"。
+- 端到端（按宿主调用方式，Git Bash 绝对路径调 wrapper）：两条通道都退出 0，stderr 有摘要，
+  开场块按 `〔本项目〕` 正常渲染。
+
+**上线前待办**
+
+- ~~重启 WorkBuddy~~：已完成，2026-11-17 审查会话确认**开场块确实进了上下文**
+  （`[记忆|会话开始] 项目 agent-memeory-brain` + 4 条）——`SessionStart` 的纯文本 stdout 通道成立。
+- 覆盖率还差数据：近 2 天只有 3 轮（2 行注入，66.7%），样本太小，C-7 继续等真实使用。
+
+**本批明确不做**：`Stop` 自动写入（§10.7 非目标 1）、`PostCompact` 清去重集（已知限制 2）、
+private 分区注入（已知限制 1）、会话累计预算的 12k 降级阶梯（等真实用量）。
+
+## 审查记录（P1.5c，独立会话执行，2026-11-17）
+
+原始报告 `.reviews/CODE-REVIEW-P1.5c-hook-2026-11-17.md`（过程稿，不入库）。结论
+「**打回修复**」，C-1 阻塞合并、M-1/M-2 阻塞 C-7 验收。15 条全部处理，逐条证据如下。
+
+| 编号 | 级别 | 问题 | 处理 | 验证证据 |
+|---|---|---|---|---|
+| **C-1** | Critical | 另一连接持写锁时 hook 阻塞 **55.3s**（`busy_timeout=10s` × `_BEGIN_ATTEMPTS=5` + 两个写事务），三条承诺全破 | 新增 `nebula/hook/db.py`：hook 自己 connect+migrate，`busy_timeout` 压到 **300ms**，并在迁移**之前**装 progress handler 到点中断；记账与日志合并成一个事务 | 持写锁实测 **2.6s** 返回（旧 55s），stdout 仍有注入块；`test_write_lock_does_not_stall_the_hook_nor_drop_the_injection`；变异：busy_timeout 改回 10000 → 红 |
+| M-1 | Major | 覆盖率分母含宿主内部通知（实测 318 轮里 97 轮是 `<task-notification>`），80% 门槛会假红 | 脚本直接 import `nebula.hook.payload` 的两个函数，不写第二份正则 | 新增 6 条 `tests/test_coverage.py`；含 2 轮真实 + 1 轮内部通知的 transcript 数出 2 |
+| M-2 | Major | stdout 管道关闭时退出码 **120**（CPython 退出时二次 flush 失败） | `_write` 失败时把 `sys.stdout` 换成 `StringIO`，并**不记账**；顺带兜住 `utf8_streams()` 在 fd 已关闭时抛的 `EBADF` | 子进程 `os.close(1)` 实测 exit **0**（修复前 120），stderr 有「输出失败·未记账」；变异：去掉置换 → 红 |
+| M-3 | Major | 去重每轮全表扫 `injection_log`（100k 6.4ms / 300k 20.8ms） | schema **v5** 加 `ix_injection_log_session (session, ts)`；去重拆成两条各自可走索引的查询 | `EXPLAIN` 两条都是 `SEARCH … USING INDEX`；100k 行 `seen_ids` p50 **0.196ms**；`test_migrate_v4_to_v5…` 断言无 `SCAN` |
+| M-4 | Major | 记账/落日志失败会连带丢掉本轮注入（块已渲染、stdout 为空） | `_settle` 包 try/except 只写 stderr；输出改为**先 emit 后记账** | `test_accounting_failure_keeps_the_block`（打桩 `log_injection` 抛错，stdout 仍有块）；变异：去掉 try/except → 红 |
+| N-1 | Minor | `log_injection` 未传 `now`，一轮两个时钟；去重窗口无上界 | 两处补 `now=parse_ts(stamp)`；窗口加 `ts <= now` | `test_log_row_uses_the_injected_now` 断言日志 ts == T0 |
+| N-2 | Minor | 未知 `<tag>` 一律跳过；宿主若改成传包装后的原文，召回整轮失效 | 分两张表：`WRAPPER_TAGS` 剥壳继续召回（只剥整条包住的外壳，保留内容），`INTERNAL_TAGS` 才跳过 | `test_wrapped_prompt_is_unwrapped_before_recall`：带 `<system-reminder>` 的消息仍注入，落库 query 是用户原话 |
+| N-3 | Minor | `resolve_for_host(None)` 回落进程 cwd，可能记到别的仓库 | 显式返回 `None`（= 没有项目身份） | `test_host_scope_drops_loose_projects` + 现有 project 用例 |
+| N-4 | Minor | 预算"逐条 break"不是最优装箱 | 不改行为，docstring 写明这是有意的（保留分数最高的前 k 条） | — |
+| N-5 | Minor | 尾注把 top_k 挤掉也算成"按长度截断" | 改为「（另有 N 条未列出）」 | 相关断言同步 |
+| N-6 | Minor | 文档 `AUTO_TOP_K` / 代码 `PROMPT_TOP_K` 分叉 | 统一到代码命名（文档 §10.7 表格改 `PROMPT_*` / `SESSION_MAX_CHARS` / `LINE_MAX_CHARS`） | 文档与 `render.py` 常量逐项对齐 |
+| N-7 | Minor | 覆盖率脚本无用例；`stat` 未兜错；`--days` 只看 mtime | 新增 `tests/test_coverage.py`（6 条）；`OSError` 跳过；`--days` 改按轮次 `timestamp` 筛 | 6 条用例全绿 |
+| N-8 | Minor | `core_memories` 没进 16 格可见性矩阵 | 矩阵参数化到两个入口（pinned 条目覆盖全部六个分区） | 新增 30 格参数化用例 |
+| N-9 | Nit | `Outcome` / `HOST_DEFAULT` 各写一遍；`Payload.event` 未用 | 抽 `nebula/hook/common.py`；事件名不匹配只提示不跳过（跳过会让通道静默失效） | 两入口共用；摘要有「事件名不匹配」 |
+| N-10 | Nit | 记账与注入日志两个事务，中间崩溃留不一致 | 合并成一个事务（与 C-1③ 同一处） | C-1 的用例覆盖；`_settle` 单事务 |
+
+**修复后复验（2026-11-17）**：`ruff` 0 / `mypy --strict` 0（39 文件）/ `pytest` **346 passed**。
+真库（已迁移到 schema v5）按宿主方式跑 wrapper：注入 1 条 50ms、exit 0。
+`feedback` 仍为 0——提醒：注入块自带 id 是它唯一的自然触发点，用起来才有数据。
+
+### 复审（R2，同日，同一审查者）
+
+报告 `.reviews/CODE-REVIEW-P1.5c-hook-R2-2026-11-17.md`（过程稿，不入库）。结论
+「**修复后通过**」，首轮 15 条逐条复核通过；新增 2 条 Minor（R2-1 影响 C-7 读数，先修再用）。
+
+| 编号 | 级别 | 问题 | 处理 | 验证证据 |
+|---|---|---|---|---|
+| R2-1 | Minor | `<user_query>` 用子串 `search`：正文里**提到**这个标签（贴 transcript、讨论 payload）会把话截成标签里的内容，截断后的文本既去召回又落 `injection_log.query` | 只在"去掉标签后没有别的正文"时才采纳 `<user_query>`（`_only_tag_blocks` 闸） | `test_user_query_tag_inside_prose_does_not_truncate`：单标签与双标签两句都原样返回；变异：去掉闸 → 红 |
+| R2-2 | Minor | 分母仍多算宿主控制消息：`data-role="error-recovery"` 剥壳后是英文样板句，被当成一轮（实测 1 条就让 6b7c2603 显示 50%、合计 75%） | 统一判定 `payload.is_user_turn`：`data-role` 不是 `user-context` 一律不算一轮，hook 也跳过；`coverage.py` 只用这一个函数 | `test_control_wrapper_is_not_a_user_turn` / `test_control_wrapper_is_skipped_by_the_hook`；实测分母 223 → **208**，近 2 天读数 4/4 = **100%**（原 75%） |
+
+顺带把复审的残余风险 1 也修了：`connect()` 加可选 `busy_timeout_ms`，从建连接那一刻就生效
+（`journal_mode = WAL` 的切换也要拿写锁，库还不是 WAL 时会等满 10s）。
+
+**复验（R2 后）**：`ruff` 0 / `mypy` 0 / `pytest` **349 passed**。残余风险 2（migrate 耗时）
+与 3（"前缀包装 + 正文在壳外"）已分别登记为"约 10M 行才撞线"与"已支持前缀形态"。
+
 ## 审查记录（P1.5a，独立会话执行）
 
 原始报告 `.reviews/CODE-REVIEW-P1.5a-adapter-2026-11-11.md`（过程稿，不入库）。结论「修复后通过」，**C-1 / M-1 阻塞合并**。以下每条都有会红的用例或实跑输出。

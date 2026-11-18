@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from nebula.adapter.pointer import BEGIN, END, install, render_block, uninstall
-from nebula.adapter.project import resolve
+from nebula.adapter.project import resolve, resolve_for_host
 
 REMOTE = "https://github.com/HelloThreeLiu/SciMate.git"
 
@@ -67,6 +67,18 @@ def test_explicit_id_wins(tmp_path: Path) -> None:
     ref = resolve(tmp_path / "repo", explicit="my-own-id")
     assert ref.project_id == "my-own-id"
     assert ref.source == "explicit"
+
+
+def test_host_scope_drops_loose_projects(tmp_path: Path) -> None:
+    """P1.5c：宿主侧（hook）拿 loose 的路径 hash 当项目边界等于把记忆绑在假项目上。"""
+    loose = tmp_path / "no-git"
+    loose.mkdir()
+    assert resolve_for_host(loose) is None
+
+    repo = _make_repo(tmp_path / "repo")
+    ref = resolve_for_host(repo)
+    assert ref is not None
+    assert ref.project_id == resolve(repo).project_id
 
 
 def test_manifest_overrides_git(tmp_path: Path) -> None:

@@ -154,12 +154,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pointer_sub = pointer_parser.add_subparsers(dest="pointer_action", required=True)
     pointer_show = pointer_sub.add_parser("show", help="打印指针块内容")
+    pointer_show.add_argument(
+        "--auto-injection",
+        action="store_true",
+        help="打印 A 档变体（召回是自动的，不再要求模型主动 recall）",
+    )
     pointer_show.set_defaults(handler=_cmd_pointer_show)
     pointer_install = pointer_sub.add_parser("install", help="写入或更新指针块（幂等）")
     pointer_install.add_argument(
         "--file",
         required=True,
         help="目标指令文件，如 ./CLAUDE.md 或 ./AGENTS.md；必填，避免写错位置",
+    )
+    pointer_install.add_argument(
+        "--auto-injection",
+        action="store_true",
+        help="装 A 档变体：宿主每轮自动注入，别再让模型自己 recall（会双重检索）",
     )
     pointer_install.set_defaults(handler=_cmd_pointer_install)
     pointer_uninstall = pointer_sub.add_parser("uninstall", help="移除指针块")
@@ -415,13 +425,13 @@ def _cmd_status(args: argparse.Namespace) -> int:
 
 
 def _cmd_pointer_show(args: argparse.Namespace) -> int:
-    print(render_block())
+    print(render_block(auto_injection=bool(args.auto_injection)))
     return 0
 
 
 def _cmd_pointer_install(args: argparse.Namespace) -> int:
     target = Path(args.file)
-    action = install_pointer(target)
+    action = install_pointer(target, auto_injection=bool(args.auto_injection))
     labels = {
         "created": "已新建并写入",
         "appended": "已追加到文件末尾",
